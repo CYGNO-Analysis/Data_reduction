@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -125,16 +126,16 @@ void initialize_log(const Options& options)
     if (options.save_pairs_directory.empty())
         return;
 
-    std::ofstream text_log(options.save_pairs_directory + "/log.txt");
-    std::ofstream csv_log(options.save_pairs_directory + "/log.csv");
+    std::ofstream text_log(options.save_pairs_directory + "/log_gpu.txt");
+    std::ofstream csv_log(options.save_pairs_directory + "/log_gpu.csv");
     if (!text_log || !csv_log)
         throw std::runtime_error("Could not create trigger logs");
 
     csv_log << "event,upload_ms,pedestal_ms,laplacian_ms,spark_threshold_ms,"
             << "spark_dilation_ms,spark_mask_ms,gaussian_ms,"
-            << "centroid_threshold_ms,centroid_dilation_ms,final_mask_ms,"
+            << "centroid_threshold_ms,centroid_dilation_ms,"
             << "download_ms,triggered_pixels,algorithm_total_ms,"
-            << "gpu_pipeline_total_ms,total_processing_ms\n";
+            << "full_trigger_total_ms,total_processing_ms\n";
 }
 
 void process_camera(const BANK32& bank, const void* data, const Options& options,
@@ -175,32 +176,40 @@ void process_camera(const BANK32& bank, const void* data, const Options& options
     for (std::size_t index = 0; index < pixels; ++index)
         image.data[index] = source[index];
 
+    static std::unique_ptr<TriggerContext> trigger_context;
+    if (!trigger_context)
+        trigger_context.reset(new TriggerContext(
+            *pedestal, options.gaussian_kernel_size, options.gaussian_sigma,
+            options.spark_cut, options.threshold_cut, options.dilation_radius));
+
     TriggerTiming timing;
-    const Image triggered = trigger_cuda(
-        image, *pedestal, options.gaussian_kernel_size, options.gaussian_sigma,
-        options.spark_cut, options.threshold_cut, options.dilation_radius, &timing
-    );
+    Image triggered;
+    std::string triggered_filename;
+    if (!options.save_pairs_directory.empty() && saved_pairs < options.max_saved_pairs)
+    {
+        const std::string index = std::to_string(saved_pairs);
+        triggered_filename = options.save_pairs_directory + "/triggered_CAM"
+            + std::to_string(options.camera_id) + "_" + index + ".pgm";
+        trigger_context->process_gpu_output_pgm(image, triggered_filename, &timing);
+    }
+    else
+        triggered = trigger_context->process_gpu_output(image, &timing);
 
     const double algorithm_ms = timing.pedestal_ms + timing.laplacian_ms
         + timing.spark_threshold_ms + timing.spark_dilation_ms + timing.spark_mask_ms
         + timing.gaussian_ms + timing.centroid_threshold_ms
-        + timing.centroid_dilation_ms + timing.final_mask_ms;
-    const double gpu_pipeline_ms = timing.upload_ms + algorithm_ms
+        + timing.centroid_dilation_ms;
+    const double full_trigger_ms = timing.upload_ms + algorithm_ms
         + timing.download_ms;
     const std::size_t triggered_pixels = timing.triggered_pixels;
-    std::cout << "Event " << event << " CAM" << options.camera_id
-              << ": algorithm=" << algorithm_ms << " ms"
-              << ", upload=" << timing.upload_ms << " ms"
-              << ", download=" << timing.download_ms << " ms"
-              << ", triggered_pixels=" << triggered_pixels << '\n';
-
     if (!options.save_pairs_directory.empty() && saved_pairs < options.max_saved_pairs)
     {
         const std::string index = std::to_string(saved_pairs);
         save_pgm(options.save_pairs_directory + "/original_CAM"
                       + std::to_string(options.camera_id) + "_" + index + ".pgm", image);
-        save_pgm(options.save_pairs_directory + "/triggered_CAM"
-                      + std::to_string(options.camera_id) + "_" + index + ".pgm", triggered);
+        if (triggered_filename.empty())
+            save_pgm(options.save_pairs_directory + "/triggered_CAM"
+                          + std::to_string(options.camera_id) + "_" + index + ".pgm", triggered);
         ++saved_pairs;
         std::cout << "Saved pair " << saved_pairs << "/"
                   << options.max_saved_pairs << '\n';
@@ -209,10 +218,17 @@ void process_camera(const BANK32& bank, const void* data, const Options& options
     const double total_processing_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - processing_start
     ).count();
+    std::cout << "Event " << event << " CAM" << options.camera_id
+              << ": algorithm=" << algorithm_ms << " ms"
+              << ", upload=" << timing.upload_ms << " ms"
+              << ", download=" << timing.download_ms << " ms"
+              << ", full_trigger_total=" << full_trigger_ms << " ms"
+              << ", total=" << total_processing_ms << " ms"
+              << ", triggered_pixels=" << triggered_pixels << '\n';
     if (!options.save_pairs_directory.empty())
     {
-        std::ofstream text_log(options.save_pairs_directory + "/log.txt", std::ios::app);
-        std::ofstream csv_log(options.save_pairs_directory + "/log.csv", std::ios::app);
+        std::ofstream text_log(options.save_pairs_directory + "/log_gpu.txt", std::ios::app);
+        std::ofstream csv_log(options.save_pairs_directory + "/log_gpu.csv", std::ios::app);
         if (!text_log || !csv_log)
             throw std::runtime_error("Could not append to trigger logs");
 
@@ -227,10 +243,9 @@ void process_camera(const BANK32& bank, const void* data, const Options& options
             << "  Gaussian: " << timing.gaussian_ms << " ms\n"
             << "  Centroid threshold: " << timing.centroid_threshold_ms << " ms\n"
             << "  Centroid dilation: " << timing.centroid_dilation_ms << " ms\n"
-            << "  Final mask: " << timing.final_mask_ms << " ms\n"
             << "  Download: " << timing.download_ms << " ms\n"
             << "  Algorithm total: " << algorithm_ms << " ms\n"
-            << "  GPU pipeline total: " << gpu_pipeline_ms << " ms\n"
+            << "  Full trigger total: " << full_trigger_ms << " ms\n"
             << "  Total processing: " << total_processing_ms << " ms\n\n";
 
         csv_log << event << ','
@@ -243,11 +258,10 @@ void process_camera(const BANK32& bank, const void* data, const Options& options
             << timing.gaussian_ms << ','
             << timing.centroid_threshold_ms << ','
             << timing.centroid_dilation_ms << ','
-            << timing.final_mask_ms << ','
             << timing.download_ms << ','
             << triggered_pixels << ','
             << algorithm_ms << ','
-            << gpu_pipeline_ms << ','
+            << full_trigger_ms << ','
             << total_processing_ms << '\n';
     }
 }

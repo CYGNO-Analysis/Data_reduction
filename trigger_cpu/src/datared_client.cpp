@@ -53,7 +53,7 @@ void print_usage(const char* program)
               << " --config FILE --camera-id N"
               << " --spark-cut N --threshold N --dilation-radius N"
               << " --save-first FILE"
-              << " --save-pairs DIR (recommended: comparison_images/)\n";
+              << " --save-pairs DIR (recommended: ../comparison_images/)\n";
 }
 
 Options parse_options(int argc, char** argv)
@@ -217,8 +217,8 @@ void initialize_logs(const Options& options)
     if (options.save_pairs_directory.empty())
         return;
 
-    std::ofstream text_log(options.save_pairs_directory + "/log.txt");
-    std::ofstream csv_log(options.save_pairs_directory + "/log.csv");
+    std::ofstream text_log(options.save_pairs_directory + "/log_cpu.txt");
+    std::ofstream csv_log(options.save_pairs_directory + "/log_cpu.csv");
     if (!text_log || !csv_log)
         throw std::runtime_error("Could not create trigger logs");
 
@@ -317,8 +317,8 @@ void process_camera(const BANK32& bank, const void* data, const Options& options
     const std::size_t triggered_pixels = timing.triggered_pixels;
     if (!options.save_pairs_directory.empty())
     {
-        std::ofstream text_log(options.save_pairs_directory + "/log.txt", std::ios::app);
-        std::ofstream csv_log(options.save_pairs_directory + "/log.csv", std::ios::app);
+        std::ofstream text_log(options.save_pairs_directory + "/log_cpu.txt", std::ios::app);
+        std::ofstream csv_log(options.save_pairs_directory + "/log_cpu.csv", std::ios::app);
         if (!text_log || !csv_log)
             throw std::runtime_error("Could not append to trigger logs");
 

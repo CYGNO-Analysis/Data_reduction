@@ -2,7 +2,7 @@ Cygno Trigger CPU
 ==================
 
 This directory contains the CPU implementation of the Cygno image trigger.
-The CUDA implementation is maintained separately in ../pains_trigger_cuda.
+The CUDA implementation is maintained separately in ../trigger_gpu.
 
 The trigger uses OpenCV CPU functions for pedestal subtraction, Laplacian
 filtering, thresholds, dilations, Gaussian filtering, and mask application.
@@ -22,9 +22,17 @@ The machine must provide:
 - MIDAS with MIDASSYS configured;
 - Git;
 
+ROOT and MIDAS are external dependencies; they are not installed by this
+README or included in the repository. Before configuring CMake, load the
+environment provided by those installations and verify their locations:
+
+  export ROOTSYS=/path/to/root
+  export MIDASSYS=/path/to/midas
+  test -x "$ROOTSYS/bin/root-config"
+  test -f "$MIDASSYS/include/midas.h"
+
 Check the environment:
 
-  nvidia-smi
   echo "$MIDASSYS"
   echo "$ROOTSYS"
   cmake --version
@@ -32,17 +40,25 @@ Check the environment:
 
 CUDA and an NVIDIA GPU are not required for this CPU version.
 
+The pedestal ROOT file is also an external input and is not tracked in Git.
+Place it at:
+
+  ../pedmaps/pedmap_run123601_rebin1.root
+
+It must contain the TH2 histograms pedmap_0 and pedmap_1 with 4096 x 2304
+bins.
+
 2. Enter the project directory
 ------------------------------
 
-  cd /home/standard/daq/pains_trigger
+  cd /path/to/Data_reduction/trigger_cpu
 
 3. Prepare the ROOT compiler workaround
 ----------------------------------------
 
 The ROOT installation on this machine searches for a compiler named
 x86_64-linux-gnu-g++-9. If that executable does not exist, create the local
-alias below. This changes nothing outside pains_trigger.
+alias below. This changes nothing outside trigger_cpu.
 
   mkdir -p tools
   ln -sfn "$(command -v x86_64-linux-gnu-g++-11)" \
@@ -66,7 +82,7 @@ CUDA Toolkit, or global OpenCV installation is required.
 5. Build and install OpenCV locally
 ------------------------------------
 
-The OpenCV installation is local to pains_trigger and does not require sudo.
+The OpenCV installation is local to trigger_cpu and does not require sudo.
 Run these commands if third_party/opencv-local does not exist, or if OpenCV
 must be rebuilt:
 
@@ -102,6 +118,7 @@ The result is installed in:
 
 The project requires the local OpenCV installation:
 
+  export PATH="$PWD/tools:$PATH"
   cmake -S . -B build \
     -DOpenCV_DIR="$PWD/third_party/opencv-local/lib/cmake/opencv4"
 
@@ -125,7 +142,7 @@ Edit the configuration file:
 
 Recommended CAM1 configuration:
 
-  pedestal_file=pedmaps/pedmap_run123601_rebin1.root
+  pedestal_file=../pedmaps/pedmap_run123685_rebin1.root
   pedestal_histogram=pedmap_1
   camera_id=1
   width=4096
@@ -136,7 +153,7 @@ Recommended CAM1 configuration:
   threshold_cut=0.5
   dilation_radius=20
   inspect_only=false
-  save_pairs_directory=comparison_images
+  save_pairs_directory=../comparison_images
   max_saved_pairs=5
 
 For CAM0, change camera_id and pedestal_histogram to 0 and pedmap_0.
@@ -157,7 +174,7 @@ buffer. The recommended command is:
 The launcher configures the local ROOT compiler helper and OpenCV runtime path,
 then runs build/CygnoTriggerDatared. It uses paths relative to its own directory.
 
-The equivalent direct command, executed from pains_trigger, is:
+The equivalent direct command, executed from trigger_cpu, is:
 
   PATH="$PWD/tools:$PATH" \
   LD_LIBRARY_PATH="$PWD/third_party/opencv-local/lib:${LD_LIBRARY_PATH:-}" \
@@ -192,7 +209,7 @@ the trigger.
 Set these values in config/configFile.txt:
 
   inspect_only=false
-  save_pairs_directory=comparison_images
+  save_pairs_directory=../comparison_images
   max_saved_pairs=5
 
 Then run:
@@ -202,21 +219,21 @@ Then run:
 The program saves at most five original and five triggered 16-bit PGM images and
 then exits. For CAM1, the files are named:
 
-  comparison_images/original_CAM1_0.pgm
-  comparison_images/triggered_CAM1_0.pgm
+  ../comparison_images/original_CAM1_0.pgm
+  ../comparison_images/triggered_CAM1_0.pgm
 
 The same directory also receives:
 
-  comparison_images/log.txt
-  comparison_images/log.csv
+  ../comparison_images/log_cpu.txt
+  ../comparison_images/log_cpu.csv
 
-The human-readable log.txt contains the trigger configuration and a separate
+The human-readable log_cpu.txt contains the trigger configuration and a separate
 multi-line block for each event. It reports every trigger stage, the algorithm
 total, the CPU pipeline total, and the total processing time including host
 conversion and PGM output. It also reports the number of pixels retained in the
 triggered image.
 
-The log.csv file contains only the numeric event table, including the
+The log_cpu.csv file contains only the numeric event table, including the
 triggered_pixels column. It has no configuration section and can be opened with
 spreadsheet software or loaded with pandas.
 
@@ -248,7 +265,7 @@ For a 4096 x 2304 image, the OpenCV CPU implementation was measured at roughly:
   centroid dilation:       approximately 55-80 ms
 
 The CPU pipeline total is the trigger time and does not include PGM output. The
-total processing time in log.txt additionally includes conversion of the MIDAS
+total processing time in log_cpu.txt additionally includes conversion of the MIDAS
 buffer and writing the original and triggered PGM files. The exact time depends
 on machine load and whether image PGM I/O is included. These values do not
 include MIDAS event acquisition.
@@ -259,11 +276,11 @@ include MIDAS event acquisition.
 The CPU outputs can be compared against the CUDA outputs using the same original
 PGM frames. The CPU reference files are stored in:
 
-  comparison_images/
+  ../comparison_images/
 
 The CUDA implementation and its validation tools are in:
 
-  ../pains_trigger_cuda/
+  ../trigger_gpu/
 
 The five tested CPU/GPU outputs were pixel-identical:
 
@@ -303,7 +320,7 @@ Configuration and launcher:
 
 Pedestal:
 
-  pedmaps/pedmap_run123601_rebin1.root
+  ../pedmaps/pedmap_run123601_rebin1.root
 
 OpenCV source and local CPU installation:
 

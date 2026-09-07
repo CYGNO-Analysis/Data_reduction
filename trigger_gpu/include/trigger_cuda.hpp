@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -38,18 +39,7 @@ struct TriggerTiming
     double centroid_dilation_ms = 0.0;
     double final_mask_ms = 0.0;
     double download_ms = 0.0;
-};
-
-struct TriggerDebug
-{
-    FloatImage pedestal_subtracted;
-    FloatImage laplacian;
-    std::vector<uint8_t> spark_mask;
-    std::vector<uint8_t> spark_dilated;
-    FloatImage sparkless;
-    FloatImage filtered;
-    std::vector<uint8_t> centroid_mask;
-    std::vector<uint8_t> centroid_dilated;
+    double cpu_output_conversion_ms = 0.0;
 };
 
 Image trigger_cuda(const Image& image, const FloatImage& pedestal,
@@ -57,10 +47,30 @@ Image trigger_cuda(const Image& image, const FloatImage& pedestal,
                    float spark_cut, float threshold_cut, int dilation_radius,
                    TriggerTiming* timing = nullptr);
 
-    Image trigger_cuda_debug(const Image& image, const FloatImage& pedestal,
-                     int gaussian_kernel_size, float gaussian_sigma,
-                     float spark_cut, float threshold_cut, int dilation_radius,
-                     TriggerDebug& debug);
+class TriggerContext
+{
+public:
+    TriggerContext(const FloatImage& pedestal, int gaussian_kernel_size,
+                   float gaussian_sigma, float spark_cut,
+                   float threshold_cut, int dilation_radius);
+    ~TriggerContext();
 
-Image read_pgm(const std::string& filename);
+    TriggerContext(const TriggerContext&) = delete;
+    TriggerContext& operator=(const TriggerContext&) = delete;
+
+    Image process(const Image& image, TriggerTiming* timing = nullptr);
+    Image process_gpu_output(const Image& image, TriggerTiming* timing = nullptr);
+    void process_gpu_output_pgm(const Image& image, const std::string& filename,
+                                TriggerTiming* timing = nullptr);
+    void copy_centroid_mask(std::vector<uint8_t>& output);
+    void copy_filtered_image(std::vector<float>& output);
+    void copy_sparkless_image(std::vector<float>& output);
+
+private:
+    Image process_impl(const Image& image, TriggerTiming* timing, bool gpu_output,
+                       const std::string* output_filename = nullptr);
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 void write_pgm(const std::string& filename, const Image& image);

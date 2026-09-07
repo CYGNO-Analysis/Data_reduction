@@ -1,0 +1,562 @@
+HISTORICO DE DESENVOLVIMENTO - CYGNO DATA REDUCTION
+====================================================
+
+Data do registro: 2026-09-07
+Repositorio local: /home/standard/pains_trigger
+Remotos: ifpains/Data_reduction (origin), CYGNO-Analysis/Data_reduction (upstream)
+
+Este arquivo registra alteracoes, testes, benchmarks e decisoes tecnicas do
+trigger CPU, trigger GPU e trigger GPU batch.
+
+1. ORGANIZACAO DO PROJETO
+--------------------------
+
+- O pedmap compartilhado foi movido para:
+    pedmaps/
+- A pasta global de comparacao foi criada em:
+    comparison_images/
+- As pastas comparison_images internas de trigger_cpu e trigger_gpu foram
+  removidas.
+- Os scripts de execucao usam run_trigger.sh.
+- O pedmap principal de teste com tres cameras e:
+    pedmaps/pedmap_run123685_rebin1.root
+- O pedmap 123686 foi usado anteriormente como teste e contem pedmap_0,
+  pedmap_1 e pedmap_2.
+- O pedmap 123685 deve ser confirmado novamente quando o upload estiver
+  completo.
+- CUDA e OpenCV CUDA sao compartilhados por trigger_gpu e trigger_gpu_batch
+  em:
+    third_party/
+  Cada pasta GPU possui um symlink local para esse diretorio compartilhado.
+- Nenhum commit ou push foi executado pelo assistente.
+
+2. VERSAO CPU
+-------------
+
+- Implementacao CPU preservada em trigger_cpu/.
+- Build recompilado com OpenCV local.
+- Imagens e logs CPU sao salvos em comparison_images/.
+- Logs CPU:
+    log_cpu.csv
+    log_cpu.txt
+
+3. VERSAO GPU ONLINE
+--------------------
+
+Implementacao mantida em trigger_gpu/.
+
+Fluxo atual por evento:
+
+- imagem da camera convertida para uint16_t / CV_16U;
+- pedestal carregado como float e mantido na GPU;
+- buffers GPU persistentes;
+- filtros CUDA persistentes;
+- stream CUDA persistente;
+- etapas do trigger enfileiradas na mesma stream;
+- uma unica espera antes de usar a mascara;
+- mascara final uint8_t / CV_8U, com valores 0 ou 255, baixada para a CPU;
+- image_triggered reconstruida na CPU usando a imagem original e a mascara;
+- arquivos PGM escritos somente depois do processamento;
+- memoria host uint16_t persistente e pinned via cudaMallocHost;
+- CUDA events usados para medir etapas sem sincronizacao intermediaria.
+
+Buffers persistentes principais:
+
+- pedestal_gpu
+- image_gpu
+- image_float
+- pedestal_subtracted
+- spark_mask
+- spark_dilated
+- centroid_mask
+- centroid_dilated
+- laplacian_image
+- sparkless_image
+- gaussian_horizontal_image
+- filtered_image
+- buffers host pinned uint16_t
+
+Tempos do trigger_gpu:
+
+- algorithm_total_ms:
+    somente etapas do trigger na GPU;
+- gpu_pipeline_total_ms:
+    upload + algorithm GPU + download da mascara;
+- cpu_reconstruction_ms:
+    aplicacao da mascara sobre a imagem original na CPU;
+- full_trigger_total_ms:
+    upload + algoritmo GPU + download + reconstruccao CPU;
+- total_processing_ms:
+    processamento completo, incluindo conversoes/copias adicionais e PGM
+    quando o salvamento esta habilitado.
+
+4. OTIMIZACOES DO TRIGGER_GPU
+-----------------------------
+
+4.1 Buffer uint16_t persistente
+
+Implementado. Remove a alocacao do vetor uint16_t em cada evento.
+
+4.2 Memoria pinned
+
+Implementado em trigger_gpu e trigger_gpu_batch com cudaMallocHost/cudaFreeHost.
+
+Resultado observado no trigger_gpu:
+
+- upload anterior, com buffer comum: aproximadamente 2.4 ms;
+- upload posterior, com buffer pinned: aproximadamente 1.4 ms.
+
+4.3 Stream CUDA persistente
+
+Implementado no TriggerContext. Todas as etapas sao enfileiradas em uma
+stream persistente e a espera ocorre apenas antes da reconstruccao CPU.
+
+4.4 CUDA events
+
+Implementado. Eventos CUDA medem upload, pedestal, Laplacian, thresholds,
+dilatacoes, Gaussian e download sem cudaDeviceSynchronize entre cada etapa.
+
+4.5 Gaussian separavel
+
+Implementado no trigger_gpu com kernels CUDA horizontal e vertical e pesos na
+memoria constante.
+
+Validacao contra a implementacao OpenCV CUDA anterior:
+
+- different_pixels=0
+- max_difference=0
+- sum_difference=0
+
+4.6 Dilatacoes CUDA proprias
+
+Implementado no trigger_gpu com kernels horizontal e vertical para:
+
+- spark dilation, raio 1;
+- centroid dilation, raio 20.
+
+Validacao contra a implementacao OpenCV CUDA anterior:
+
+- different_pixels=0
+- max_difference=0
+- sum_difference=0
+
+5. BENCHMARKS TRIGGER_GPU
+--------------------------
+
+Os valores variam com inicializacao CUDA, estado de memoria, I/O e carga da
+maquina. Os valores abaixo sao referencias observadas nesta maquina, para uma
+imagem 4096 x 2304.
+
+Antes das otimizacoes principais:
+
+- algoritmo GPU: aproximadamente 6 a 10 ms;
+- upload antigo: aproximadamente 10 a 30 ms, com pedestal sendo enviado por
+  evento;
+- download antigo da imagem completa e mascara: muito maior que o download
+  atual.
+
+Depois de buffer persistente, pinned memory, stream, events, Gaussian e
+dilatacoes customizadas:
+
+- algoritmo GPU estavel: aproximadamente 5.5 a 6 ms;
+- upload estavel: aproximadamente 1.4 ms;
+- download da mascara: aproximadamente 5.5 a 6 ms;
+- reconstruccao CPU: aproximadamente 30 a 32 ms;
+- full_trigger_total estavel: aproximadamente 43 a 45 ms;
+- primeiro evento pode ser muito mais lento por inicializacao CUDA;
+- total_processing_ms inclui escrita PGM quando habilitada e fica na ordem de
+  centenas de milissegundos.
+
+6. VERSAO GPU BATCH
+--------------------
+
+Implementacao mantida em trigger_gpu_batch/.
+
+Caracteristicas:
+
+- processa CAM0, CAM1 e CAM2 como um lote;
+- layout GPU [camera][height][width];
+- um pipeline CUDA para tres planos;
+- pedestais das tres cameras enviados uma vez e mantidos na GPU;
+- entrada uint16_t;
+- mascara final uint8_t baixada;
+- reconstruccao das tres imagens na CPU;
+- buffer batch host pinned via cudaMallocHost;
+- stream CUDA persistente;
+- CUDA events detalham as etapas sem sincronizacao intermediaria.
+
+Logs batch:
+
+- log_gpu_batch.txt
+- log_gpu_batch.csv
+
+Tempos batch:
+
+- gpu_ms:
+    tempo GPU do lote das tres cameras;
+- gpu_pipeline_total_ms:
+    upload do lote + etapas GPU + download da mascara;
+- cpu_reconstruction_ms:
+    reconstruccao das tres imagens na CPU;
+- full_trigger_total_ms:
+    GPU pipeline total + reconstruccao CPU;
+- total_ms:
+    processamento batch medido pelo cliente, sem interpretar como tempo de
+    uma unica camera; inclui o conjunto CAM0/CAM1/CAM2 e, quando habilitado,
+    a escrita das imagens ocorre depois dessa medicao dependendo do ponto do
+    cliente.
+
+7. BENCHMARKS GPU BATCH
+------------------------
+
+Benchmark offline controlado, sem MIDAS e sem I/O de saida:
+
+- sequencial de tres imagens: aproximadamente 275 ms;
+- versao com tres streams: aproximadamente 250 ms;
+- batch inicial: aproximadamente 254 ms.
+
+Depois da reducao de transferencias e reconstruccao vetorizada:
+
+- batch offline Release: aproximadamente 125.8 ms;
+- GPU puro do batch: aproximadamente 10.6 ms.
+
+Execucao online batch observada antes da telemetria detalhada:
+
+- GPU batch: aproximadamente 17 ms;
+- total online: aproximadamente 240 a 253 ms.
+
+Apos a instrumentacao por CUDA events, valores observados incluem:
+
+- GPU batch: aproximadamente 7.3 ms;
+- GPU pipeline total: aproximadamente 19 a 24 ms;
+- full trigger total: aproximadamente 105 a 114 ms;
+- total online: aproximadamente 119 a 129 ms.
+
+8. VERSAO GPU PARALLEL / STREAMS
+---------------------------------
+
+A versao trigger_gpu_parallel/ foi criada como prova de conceito com tres
+streams independentes e depois removida por decisao do projeto.
+
+Benchmark controlado anterior:
+
+- sequencial de tres imagens: aproximadamente 275 ms;
+- tres streams: aproximadamente 250 ms;
+- ganho aproximado: 9%, considerado pequeno.
+
+No fluxo online os tempos chegaram a aproximadamente 770 a 820 ms, por causa
+de custos de transferencias, sincronizacoes, downloads e integracao do fluxo.
+A versao foi removida e nao deve ser usada.
+
+9. CHECKLIST DE OTIMIZACOES
+----------------------------
+
+[OK] Buffer uint16_t persistente em trigger_gpu.
+[OK] Buffer uint16_t persistente em trigger_gpu_batch.
+[OK] Memoria pinned em trigger_gpu.
+[OK] Memoria pinned em trigger_gpu_batch.
+[OK] Pedestal persistente na GPU em trigger_gpu.
+[OK] Pedestais persistentes na GPU em trigger_gpu_batch.
+[OK] Stream CUDA persistente em trigger_gpu.
+[OK] Stream CUDA persistente em trigger_gpu_batch.
+[OK] CUDA events sem sincronizacao intermediaria em trigger_gpu.
+[OK] CUDA events detalhados em trigger_gpu_batch.
+[OK] Gaussian separavel em trigger_gpu.
+[OK] Gaussian separavel em trigger_gpu_batch.
+[OK] Dilatacoes CUDA proprias em trigger_gpu.
+[OK] Dilatacoes CUDA proprias em trigger_gpu_batch.
+[OK] Equivalencia pixel a pixel validada para Gaussian do trigger_gpu.
+[OK] Equivalencia pixel a pixel validada para dilatacoes do trigger_gpu.
+
+Proximas possibilidades, ainda nao implementadas:
+
+[ ] CUDA Graphs.
+[ ] Pipeline entre eventos com buffers duplos/triplos.
+[ ] Reducao adicional da reconstruccao CPU.
+[ ] Profiling formal com Nsight Systems/Compute.
+
+11. BENCHMARK A/B: MASCARA CPU VS IMAGEM FINAL GPU
+--------------------------------------------------
+
+Foi criado temporariamente um caminho B no TriggerContext para gerar a
+imagem final uint16_t na GPU aplicando a mascara e baixa-la para a CPU. O
+caminho A continuou baixando a mascara e reconstruindo a imagem na CPU.
+
+Teste offline:
+
+- mesma imagem original_CAM1_0.pgm;
+- mesmo pedestal pedmap_run123685_rebin1.root;
+- cinco iteracoes sem MIDAS e sem I/O PGM/log.
+
+Resultado:
+
+  different_pixels=0
+  max_difference=0
+  sum_difference=0
+  cpu_mask_reconstruction_mean_ms=39.149
+  gpu_image_download_mean_ms=29.571
+  gpu_over_cpu=0.755
+
+O caminho de gerar a imagem na GPU foi aproximadamente 24.5% mais rapido no
+benchmark, alem de produzir resultado pixel a pixel identico. O benchmark
+temporario foi removido do CMake e dos fontes; a API process_gpu_output() foi
+mantida no TriggerContext e passou a ser usada pelo cliente online.
+
+Teste online posterior do caminho GPU-output:
+
+- cpu_reconstruction_ms: 0 ms;
+- cpu_output_conversion_ms: aproximadamente 3.9 a 6.0 ms;
+- full_trigger_total_ms estavel: aproximadamente 8 a 10 ms;
+- primeiro evento mais lento por inicializacao CUDA;
+- equivalencia pixel a pixel do benchmark: different_pixels=0.
+
+O full_trigger_total_ms caiu de aproximadamente 43-45 ms para aproximadamente
+8-10 ms por evento estavel, sem incluir PGM/log I/O.
+
+Posteriormente, o buffer host de saida uint16_t tambem foi tornado persistente
+e pinned via cudaMallocHost. O download estabilizou em aproximadamente 1.4 ms,
+inclusive no primeiro evento medido apos a inicializacao, e o full trigger
+estavel caiu para aproximadamente 7.3-7.5 ms.
+
+12. BATCH: IMAGEM FINAL GERADA NA GPU
+--------------------------------------
+
+O trigger_gpu_batch foi migrado para gerar a imagem final uint16_t na GPU,
+baixar as tres imagens em um buffer pinned e converter apenas o formato na CPU.
+
+Resultado online inicial:
+
+- gpu_pipeline_total_ms: aproximadamente 11.5 ms;
+- cpu_output_conversion_ms: aproximadamente 68-70 ms;
+- full_trigger_total_ms: aproximadamente 79-81 ms;
+- total online: aproximadamente 94 ms.
+
+O total melhorou em relacao aos aproximadamente 119-129 ms anteriores, mas a
+conversao CPU do lote de tres imagens ainda e um gargalo relevante. A
+equivalencia pixel a pixel contra o caminho batch anterior ainda deve ser
+validada antes de considerar a alteracao final.
+
+Otimizacao posterior do batch:
+
+- o cliente passou a usar synchronize_uint16();
+- as imagens triggered uint16_t baixadas sao gravadas diretamente em PGM;
+- a conversao CPU das tres imagens foi removida do caminho online;
+- cpu_output_conversion_ms passou a 0 ms;
+- full_trigger_total_ms observado caiu para aproximadamente 69-70 ms;
+- total online observado caiu para aproximadamente 49-58 ms, dependendo do I/O.
+
+O caminho online foi ajustado para gravar diretamente do buffer pinned, sem
+copiar as tres imagens para vetores CPU. Com essa alteracao:
+
+- cpu_output_conversion_ms foi removido da telemetria;
+- full_trigger_total_ms observado: aproximadamente 10.8 ms;
+- total online observado: aproximadamente 26-28 ms.
+
+Validacao offline posterior contra TriggerContext individual usando os mesmos
+quadros e pedestais:
+
+  CAM0: different_pixels=56557, max_difference=351, sum_difference=11297443
+  CAM1: different_pixels=89380, max_difference=441, sum_difference=17877098
+  CAM2: different_pixels=103710, max_difference=365, sum_difference=20699595
+
+Conclusao: o caminho batch GPU-output ainda nao e pixel a pixel equivalente ao
+TriggerContext individual. A alteracao deve ser investigada antes de ser
+considerada validada para producao.
+
+Instrumentacao temporaria etapa a etapa:
+
+- comparador do primeiro estagio, Laplacian customizado batch vs filtro OpenCV
+  CUDA, usando a mesma imagem CAM1 e pedestal;
+- different_values=917;
+- max_difference=0.00012207;
+- sum_difference=0.0409546.
+
+Conclusao do diagnostico: o Laplacian batch apresenta pequenas diferencas de
+ponto flutuante em relacao ao OpenCV CUDA. Como o pipeline aplica thresholds,
+essas pequenas diferencas podem ser amplificadas e explicar as diferencas
+observadas na mascara final. O comparador foi removido depois do teste.
+
+Comparacao especifica de image_sparkless, usando a mesma imagem CAM1 e pedestal:
+
+  spark_mask_different=0
+  spark_dilated_different=0
+  sparkless_different=0
+  batch_sparkless_zero=6396
+  reference_sparkless_zero=6396
+  sparkless_max_difference=0
+  sparkless_sum_difference=0
+
+Conclusao: a pequena diferenca numerica do Laplacian nao atravessa o corte 400,
+nao altera a mascara de sparks e nao altera image_sparkless. A divergencia final
+do batch aparece em uma etapa posterior do pipeline.
+
+Comparacao offline do Gaussian e centroid threshold:
+
+  gaussian_different=7314906
+  gaussian_max_difference=3.8147e-06
+  gaussian_sum_difference=0.18035
+  centroid_different=0
+  custom_centroids=734275
+  reference_centroids=734275
+
+Conclusao: os valores float do Gaussian diferem por arredondamento em muitos
+pixels, mas a diferenca maxima e muito pequena. O threshold de centroides produz
+mascaras identicas e a mesma quantidade de centroides. A divergencia final do
+batch nao aparece nessa etapa de threshold.
+
+Contagem da mascara final dilatada para o mesmo original_CAM1_0.pgm e pedestal:
+
+  batch CAM1 evento 1: 2362000 pixels
+  trigger_gpu individual: 2462305 pixels
+  diferenca: 100305 pixels
+
+Conclusao: a diferenca final aparece depois do centroid threshold, na mascara
+final dilatada ou na forma como ela e aplicada. A contagem de centroides anterior
+era igual, mas nao era a contagem da mascara final que determina a imagem.
+
+Revalidacao final CAM1 com o mesmo original_CAM1_0.pgm e o mesmo pedestal 123685:
+
+  different_pixels=100459
+  max_difference=406
+  sum_difference=20083982
+
+O resultado confirma que a saida batch e a saida individual ainda nao sao
+pixel a pixel equivalentes. A causa deve ser investigada no primeiro estagio
+divergente antes de usar a nova saida batch como referencia fisica.
+
+Correcao de telemetria batch:
+
+O batch GPU-output estava calculando triggered_pixels com countNonZero da imagem
+final. Isso nao e equivalente a contar pixels ativos da mascara, pois pixels
+originais com valor zero podem estar selecionados pela mascara. A contagem foi
+corrigida para usar um kernel CUDA diretamente sobre a mascara final. As
+comparacoes antigas de triggered_pixels entre batch e GPU individual devem ser
+desconsideradas; novas comparacoes precisam usar o mesmo evento e a metrica
+corrigida.
+
+Recomparacao apos a correcao da contagem, usando um novo original_CAM1_0.pgm:
+
+  batch CAM1 mask pixels: 1900415
+  trigger_gpu individual mask pixels: 2008431
+  different_pixels=108264
+  max_difference=435
+  sum_difference=21640715
+
+Conclusao: a correcao da metrica nao corrigiu a divergencia das mascaras. O
+batch e o trigger individual continuam produzindo imagens diferentes.
+
+Validacao final apos corrigir spark_radius=1 no batch:
+
+  batch CAM1 mask: 1454167 pixels
+  trigger_gpu individual: 1454167 pixels
+  different_pixels=0
+  max_difference=0
+  sum_difference=0
+
+Conclusao: apos a correcao do raio da dilatacao de sparks, as imagens finais
+batch e individual ficaram pixel a pixel identicas para o mesmo evento CAM1.
+
+Validacao final completa apos spark_radius=1:
+
+  CAM0: different_pixels=0, max_difference=0, sum_difference=0
+  CAM1: different_pixels=0, max_difference=0, sum_difference=0
+  CAM2: different_pixels=0, max_difference=0, sum_difference=0
+
+Os dois algoritmos agora produzem resultados finais identicos para as tres
+cameras quando usam os mesmos frames, parametros e pedestais.
+
+Investigacao de image_sparkless encontrou a causa real: o batch usava
+dilation_radius=20 tambem para a dilatacao de sparks. O trigger individual usa
+raio 1 para sparks e raio 20 apenas para centroides.
+
+Antes da correcao:
+
+  individual_sparkless_zero=6579
+  batch_sparkless_zero=415422
+
+Depois de corrigir spark_radius=1 no batch:
+
+  different=0
+  max=0
+  sum=0
+  individual_sparkless_zero=6579
+  batch_sparkless_zero=6579
+
+Conclusao: nao havia contaminacao entre cameras. O batch estava aplicando a
+dilatacao de sparks com o raio dos centroides, causando a divergencia massiva.
+
+Comparacao direta da mascara final dilatada no mesmo evento CAM1:
+
+  batch final mask: 2969672 pixels
+  trigger_gpu individual final mask: 3042232 pixels
+  diferenca: 72560 pixels
+
+Conclusao: a diferenca esta confirmada na mascara final criada antes do
+download da imagem. O download nao e a causa da divergencia.
+
+Comparacao direta das mascaras de centroides para o mesmo original_CAM1_0.pgm
+e pedestal 123685:
+
+  individual_active=962192
+  batch_active=904001
+  different_pixels=58705
+
+Conclusao: a divergencia ja existe na mascara de centroides antes da dilatacao
+final. A contagem anterior igual comparava caminhos diferentes e nao deve ser
+usada como evidencia de equivalencia entre batch e individual.
+
+10. TESTES E VALIDACOES
+-----------------------
+
+- CPU build recompilado e executado.
+- GPU build recompilado em Release e executado via MIDAS.
+- Batch build recompilado em Release e executado via MIDAS.
+- Pedestal 123686 confirmou pedmap_0, pedmap_1 e pedmap_2.
+- Pedestal 123685 deve continuar sendo confirmado quando o upload estiver
+  completo.
+- Logs e imagens foram gerados em comparison_images/.
+- get_errors nao encontrou erros nos arquivos principais.
+- git diff --check passou nas validacoes finais.
+- Nenhum git commit ou git push foi feito pelo assistente.
+
+13. RESUMO DA SESSAO DE 2026-09-08
+-----------------------------------
+
+- Confirmado que trigger_gpu e trigger_gpu_batch usam o mesmo arquivo:
+    pedmaps/pedmap_run123685_rebin1.root
+- Confirmados os histogramas:
+    trigger_gpu: pedmap_1 para CAM1;
+    trigger_gpu_batch: pedmap_0, pedmap_1 e pedmap_2.
+- O trigger_gpu_batch foi limpo para conter apenas o trigger online. O benchmark
+  offline foi removido do CMake, fonte e build final.
+- O trigger_gpu foi limpo para conter apenas o executavel online. Comparadores
+  temporarios sempre foram removidos depois das validacoes.
+- A telemetria batch foi padronizada para mostrar algorithm, upload, download,
+  full_trigger_total e total. Os campos gpu_pipeline_total e
+  cpu_output_conversion foram removidos do print batch.
+- No trigger_gpu, os campos redundantes gpu_pipeline_total e
+  cpu_output_conversion foram removidos do print/CSV, mantendo
+  full_trigger_total como upload + algoritmo GPU + download.
+- O batch passou a gravar diretamente do buffer pinned uint16_t, eliminando a
+  copia das imagens finais para vetores CPU. O full_trigger_total observado
+  ficou aproximadamente em 10.8 ms e o total em aproximadamente 26-28 ms.
+- Foi feita instrumentacao offline etapa a etapa para investigar a divergencia
+  batch/individual.
+- O Laplacian customizado batch diferiu do OpenCV CUDA apenas numericamente:
+    different_values=917;
+    max_difference=0.00012207;
+    sum_difference=0.0409546.
+- image_sparkless inicialmente divergiu fortemente porque o batch aplicava
+  raio 20 na dilatacao de sparks. O trigger individual usa raio 1 para sparks
+  e raio 20 para centroides.
+- A correcao foi aplicada no batch: spark_radius=1.
+- Depois da correcao, image_sparkless ficou identica e a validacao final para
+  as tres cameras passou:
+    CAM0 different_pixels=0, max_difference=0, sum_difference=0;
+    CAM1 different_pixels=0, max_difference=0, sum_difference=0;
+    CAM2 different_pixels=0, max_difference=0, sum_difference=0.
+- A causa nao era contaminacao entre cameras nem o download. Era o raio de
+  dilatacao incorreto no estagio de sparks.
+- Os builds finais foram recriados e mantem somente:
+    trigger_gpu/build/CygnoTriggerCudaDatared;
+    trigger_gpu_batch/build/CygnoTriggerCudaBatch.

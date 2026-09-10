@@ -301,11 +301,9 @@ struct BatchTrigger::Impl
     uint16_t* output_host = nullptr;
         unsigned int counts_host[camera_count]{};
     std::vector<float> pedestal_host;
-    static constexpr int stage_count = 10;
+    static constexpr int stage_count = 11;
     cudaEvent_t stage_start[stage_count]{};
     cudaEvent_t stage_end[stage_count]{};
-    cudaEvent_t start_event = nullptr;
-    cudaEvent_t end_event = nullptr;
     bool pedestals_set = false;
     bool pending = false;
 
@@ -355,8 +353,6 @@ struct BatchTrigger::Impl
         check_cuda(cudaMemcpyToSymbol(gaussian_weights, weights.data(),
                                       weights.size() * sizeof(float)),
                    "copy Gaussian weights");
-        check_cuda(cudaEventCreate(&start_event), "create batch start event");
-        check_cuda(cudaEventCreate(&end_event), "create batch end event");
         for (int stage = 0; stage < stage_count; ++stage)
         {
             check_cuda(cudaEventCreate(&stage_start[stage]), "create batch stage start");
@@ -377,10 +373,6 @@ struct BatchTrigger::Impl
             if (stage_end[stage])
                 cudaEventDestroy(stage_end[stage]);
         }
-        if (start_event)
-            cudaEventDestroy(start_event);
-        if (end_event)
-            cudaEventDestroy(end_event);
     }
 };
 
@@ -436,9 +428,6 @@ void BatchTrigger::enqueue(const std::array<Image, 3>& images)
                                    reinterpret_cast<cudaStream_t>(impl_->stream.cudaPtr())),
                    "record batch stage end");
     };
-    check_cuda(cudaEventRecord(impl_->start_event,
-                               reinterpret_cast<cudaStream_t>(impl_->stream.cudaPtr())),
-               "record batch start");
     record_start(0);
     impl_->input_gpu.upload(input_host, impl_->stream);
     record_end(0);
@@ -550,6 +539,7 @@ void BatchTrigger::enqueue(const std::array<Image, 3>& images)
     launch(reinterpret_cast<const void*>(dilate_vertical_kernel), centroid_vertical_arguments,
            "batch centroid vertical dilation");
     record_end(8);
+    record_start(9);
     void* result_arguments[] = {&input_pointer, &input_step,
         &centroid_dilated_pointer, &centroid_dilated_step, &result_pointer,
         &result_step, &width, &height};
@@ -565,9 +555,7 @@ void BatchTrigger::enqueue(const std::array<Image, 3>& images)
         &counts_pointer, &width, &height};
     launch(reinterpret_cast<const void*>(count_mask_kernel), count_arguments,
            "batch count final mask");
-    check_cuda(cudaEventRecord(impl_->end_event,
-                               reinterpret_cast<cudaStream_t>(impl_->stream.cudaPtr())),
-               "record batch end");
+    record_end(9);
     impl_->pending = true;
 }
 
@@ -578,12 +566,12 @@ void BatchTrigger::synchronize(std::array<Image, 3>& results, BatchTiming& timin
     cv::Mat result_host(impl_->height * camera_count, impl_->width, CV_16U,
                         impl_->output_host);
         cv::Mat counts_host(1, camera_count, CV_32S);
-    check_cuda(cudaEventRecord(impl_->stage_start[9],
+    check_cuda(cudaEventRecord(impl_->stage_start[10],
                                reinterpret_cast<cudaStream_t>(impl_->stream.cudaPtr())),
                "record batch download start");
     impl_->result_gpu.download(result_host, impl_->stream);
         impl_->counts_gpu.download(counts_host, impl_->stream);
-    check_cuda(cudaEventRecord(impl_->stage_end[9],
+    check_cuda(cudaEventRecord(impl_->stage_end[10],
                                reinterpret_cast<cudaStream_t>(impl_->stream.cudaPtr())),
                "record batch download end");
     impl_->stream.waitForCompletion();
@@ -603,7 +591,8 @@ void BatchTrigger::synchronize(std::array<Image, 3>& results, BatchTiming& timin
     timing.gaussian_ms = elapsed_stage(6);
     timing.centroid_threshold_ms = elapsed_stage(7);
     timing.centroid_dilation_ms = elapsed_stage(8);
-    timing.download_ms = elapsed_stage(9);
+    timing.mask_apply_ms = elapsed_stage(9);
+    timing.download_ms = elapsed_stage(10);
     for (int camera = 0; camera < camera_count; ++camera)
     {
         results[camera] = Image(impl_->width, impl_->height);
@@ -619,10 +608,10 @@ void BatchTrigger::synchronize(std::array<Image, 3>& results, BatchTiming& timin
         timing.triggered_pixels[camera] = static_cast<std::size_t>(
             counts_host.at<int>(0, camera));
     }
-    float elapsed = 0.0f;
-    check_cuda(cudaEventElapsedTime(&elapsed, impl_->start_event, impl_->end_event),
-               "measure batch trigger");
-    timing.gpu_ms = elapsed;
+    float full_elapsed_ms = 0.0f;
+    check_cuda(cudaEventElapsedTime(&full_elapsed_ms, impl_->stage_start[0],
+                                    impl_->stage_end[10]), "measure batch full trigger span");
+    timing.full_trigger_ms = static_cast<double>(full_elapsed_ms);
     impl_->pending = false;
 }
 
@@ -633,12 +622,12 @@ void BatchTrigger::synchronize_output(BatchTiming& timing)
     cv::Mat result_host(impl_->height * camera_count, impl_->width, CV_16U,
                         impl_->output_host);
     cv::Mat counts_host(1, camera_count, CV_32S);
-    check_cuda(cudaEventRecord(impl_->stage_start[9],
+    check_cuda(cudaEventRecord(impl_->stage_start[10],
                                reinterpret_cast<cudaStream_t>(impl_->stream.cudaPtr())),
                "record batch download start");
     impl_->result_gpu.download(result_host, impl_->stream);
     impl_->counts_gpu.download(counts_host, impl_->stream);
-    check_cuda(cudaEventRecord(impl_->stage_end[9],
+    check_cuda(cudaEventRecord(impl_->stage_end[10],
                                reinterpret_cast<cudaStream_t>(impl_->stream.cudaPtr())),
                "record batch download end");
     impl_->stream.waitForCompletion();
@@ -657,16 +646,17 @@ void BatchTrigger::synchronize_output(BatchTiming& timing)
     timing.gaussian_ms = elapsed_stage(6);
     timing.centroid_threshold_ms = elapsed_stage(7);
     timing.centroid_dilation_ms = elapsed_stage(8);
-    timing.download_ms = elapsed_stage(9);
+    timing.mask_apply_ms = elapsed_stage(9);
+    timing.download_ms = elapsed_stage(10);
     for (int camera = 0; camera < camera_count; ++camera)
     {
         timing.triggered_pixels[camera] = static_cast<std::size_t>(
             counts_host.at<int>(0, camera));
     }
-    float elapsed = 0.0f;
-    check_cuda(cudaEventElapsedTime(&elapsed, impl_->start_event, impl_->end_event),
-               "measure batch trigger");
-    timing.gpu_ms = elapsed;
+    float full_elapsed_ms = 0.0f;
+    check_cuda(cudaEventElapsedTime(&full_elapsed_ms, impl_->stage_start[0],
+                                    impl_->stage_end[10]), "measure batch full trigger span");
+    timing.full_trigger_ms = static_cast<double>(full_elapsed_ms);
     impl_->pending = false;
 }
 

@@ -134,8 +134,8 @@ void initialize_log(const Options& options)
     csv_log << "event,upload_ms,pedestal_ms,laplacian_ms,spark_threshold_ms,"
             << "spark_dilation_ms,spark_mask_ms,gaussian_ms,"
             << "centroid_threshold_ms,centroid_dilation_ms,"
-            << "download_ms,triggered_pixels,algorithm_total_ms,"
-            << "full_trigger_total_ms,total_processing_ms\n";
+            << "mask_apply_ms,download_ms,triggered_pixels,algorithm_total_ms,"
+            << "full_trigger_total_ms,full_trigger_sum_check_ms,total_processing_ms\n";
 }
 
 void process_camera(const BANK32& bank, const void* data, const Options& options,
@@ -199,8 +199,10 @@ void process_camera(const BANK32& bank, const void* data, const Options& options
         + timing.spark_threshold_ms + timing.spark_dilation_ms + timing.spark_mask_ms
         + timing.gaussian_ms + timing.centroid_threshold_ms
         + timing.centroid_dilation_ms;
-    const double full_trigger_ms = timing.upload_ms + algorithm_ms
-        + timing.download_ms;
+    // Cross-check only: sum of individually timed stages, not a direct measurement.
+    const double full_trigger_sum_ms = timing.upload_ms + algorithm_ms
+        + timing.mask_apply_ms + timing.download_ms;
+    const double full_trigger_ms = timing.full_trigger_ms;
     const std::size_t triggered_pixels = timing.triggered_pixels;
     if (!options.save_pairs_directory.empty() && saved_pairs < options.max_saved_pairs)
     {
@@ -223,6 +225,7 @@ void process_camera(const BANK32& bank, const void* data, const Options& options
               << ", upload=" << timing.upload_ms << " ms"
               << ", download=" << timing.download_ms << " ms"
               << ", full_trigger_total=" << full_trigger_ms << " ms"
+              << ", full_trigger_sum_check=" << full_trigger_sum_ms << " ms"
               << ", total=" << total_processing_ms << " ms"
               << ", triggered_pixels=" << triggered_pixels << '\n';
     if (!options.save_pairs_directory.empty())
@@ -243,9 +246,11 @@ void process_camera(const BANK32& bank, const void* data, const Options& options
             << "  Gaussian: " << timing.gaussian_ms << " ms\n"
             << "  Centroid threshold: " << timing.centroid_threshold_ms << " ms\n"
             << "  Centroid dilation: " << timing.centroid_dilation_ms << " ms\n"
+            << "  Mask apply: " << timing.mask_apply_ms << " ms\n"
             << "  Download: " << timing.download_ms << " ms\n"
             << "  Algorithm total: " << algorithm_ms << " ms\n"
             << "  Full trigger total: " << full_trigger_ms << " ms\n"
+            << "  Full trigger (sum check): " << full_trigger_sum_ms << " ms\n"
             << "  Total processing: " << total_processing_ms << " ms\n\n";
 
         csv_log << event << ','
@@ -258,10 +263,12 @@ void process_camera(const BANK32& bank, const void* data, const Options& options
             << timing.gaussian_ms << ','
             << timing.centroid_threshold_ms << ','
             << timing.centroid_dilation_ms << ','
+            << timing.mask_apply_ms << ','
             << timing.download_ms << ','
             << triggered_pixels << ','
             << algorithm_ms << ','
             << full_trigger_ms << ','
+            << full_trigger_sum_ms << ','
             << total_processing_ms << '\n';
     }
 }

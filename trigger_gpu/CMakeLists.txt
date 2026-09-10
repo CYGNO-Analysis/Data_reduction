@@ -14,7 +14,7 @@ find_package(ROOT REQUIRED COMPONENTS Hist)
 find_package(Midas REQUIRED PATHS $ENV{MIDASSYS})
 find_package(OpenCV REQUIRED COMPONENTS core imgproc cudaarithm cudafilters cudaimgproc)
 
-add_library(trigger_cuda src/trigger_cuda.cu src/trigger_context.cu src/root_io.cpp)
+add_library(trigger_cuda src/trigger_context.cu src/root_io.cpp)
 target_include_directories(trigger_cuda PUBLIC include ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(trigger_cuda PUBLIC ${OpenCV_LIBS} CUDA::cudart ROOT::Hist)
 

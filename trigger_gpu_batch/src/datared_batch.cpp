@@ -112,8 +112,8 @@ void initialize_log(const Options& options)
         throw std::runtime_error("Could not create batch logs");
     csv << "event,upload_ms,pedestal_ms,laplacian_ms,spark_threshold_ms,"
         << "spark_dilation_ms,spark_mask_ms,gaussian_ms,centroid_threshold_ms,"
-        << "centroid_dilation_ms,download_ms,algorithm_total_ms,"
-        << "full_trigger_total_ms,total_ms,"
+        << "centroid_dilation_ms,mask_apply_ms,download_ms,algorithm_total_ms,"
+        << "full_trigger_total_ms,full_trigger_sum_check_ms,total_ms,"
         << "camera0_pixels,camera1_pixels,camera2_pixels\n";
 }
 
@@ -136,8 +136,10 @@ void append_log(const Options& options, unsigned int event, const BatchTiming& t
         + timing.spark_threshold_ms + timing.spark_dilation_ms
         + timing.spark_mask_ms + timing.gaussian_ms
         + timing.centroid_threshold_ms + timing.centroid_dilation_ms;
-    const double full_trigger_ms = timing.upload_ms + algorithm_ms
-        + timing.download_ms;
+    // Cross-check only: sum of individually timed stages, not a direct measurement.
+    const double full_trigger_sum_ms = timing.upload_ms + algorithm_ms
+        + timing.mask_apply_ms + timing.download_ms;
+    const double full_trigger_ms = timing.full_trigger_ms;
         text << "Event " << event << "\n"
             << "  Upload: " << timing.upload_ms << " ms\n"
             << "  Pedestal subtraction: " << timing.pedestal_ms << " ms\n"
@@ -148,10 +150,11 @@ void append_log(const Options& options, unsigned int event, const BatchTiming& t
             << "  Gaussian: " << timing.gaussian_ms << " ms\n"
             << "  Centroid threshold: " << timing.centroid_threshold_ms << " ms\n"
             << "  Centroid dilation: " << timing.centroid_dilation_ms << " ms\n"
+            << "  Mask apply: " << timing.mask_apply_ms << " ms\n"
             << "  Download: " << timing.download_ms << " ms\n"
              << "  Algorithm total: " << algorithm_ms << " ms\n"
              << "  Full trigger total: " << full_trigger_ms << " ms\n"
-             << "  GPU batch: " << timing.gpu_ms << " ms\n"
+             << "  Full trigger (sum check): " << full_trigger_sum_ms << " ms\n"
              << "  Total processing: " << total_ms << " ms\n"
          << "  triggered_pixels: " << timing.triggered_pixels[0] << ", "
          << timing.triggered_pixels[1] << ", " << timing.triggered_pixels[2] << "\n\n";
@@ -159,8 +162,10 @@ void append_log(const Options& options, unsigned int event, const BatchTiming& t
         << timing.laplacian_ms << ',' << timing.spark_threshold_ms << ','
         << timing.spark_dilation_ms << ',' << timing.spark_mask_ms << ','
         << timing.gaussian_ms << ',' << timing.centroid_threshold_ms << ','
-        << timing.centroid_dilation_ms << ',' << timing.download_ms << ','
-        << algorithm_ms << ',' << full_trigger_ms << ',' << total_ms << ','
+        << timing.centroid_dilation_ms << ',' << timing.mask_apply_ms << ','
+        << timing.download_ms << ','
+        << algorithm_ms << ',' << full_trigger_ms << ',' << full_trigger_sum_ms << ','
+        << total_ms << ','
         << timing.triggered_pixels[0] << ',' << timing.triggered_pixels[1] << ','
         << timing.triggered_pixels[2] << '\n';
 }
@@ -283,8 +288,10 @@ int main(int argc, char** argv)
                 + timing.spark_threshold_ms + timing.spark_dilation_ms
                 + timing.spark_mask_ms + timing.gaussian_ms
                 + timing.centroid_threshold_ms + timing.centroid_dilation_ms;
-            const double full_trigger_ms = timing.upload_ms + gpu_algorithm_ms
-                + timing.download_ms;
+            // Cross-check only: sum of individually timed stages, not a direct measurement.
+            const double full_trigger_sum_ms = timing.upload_ms + gpu_algorithm_ms
+                + timing.mask_apply_ms + timing.download_ms;
+            const double full_trigger_ms = timing.full_trigger_ms;
             if (!options.save_pairs_directory.empty())
             {
                 const std::string index = std::to_string(saved_sets);
@@ -303,6 +310,7 @@ int main(int argc, char** argv)
                       << " ms, upload=" << timing.upload_ms
                       << " ms, download=" << timing.download_ms
                       << " ms, full_trigger_total=" << full_trigger_ms
+                      << " ms, full_trigger_sum_check=" << full_trigger_sum_ms
                       << " ms, total=" << total_ms << " ms"
                       << ", triggered_pixels=[CAM0=" << timing.triggered_pixels[0]
                       << ", CAM1=" << timing.triggered_pixels[1]

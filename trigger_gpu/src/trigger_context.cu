@@ -14,6 +14,18 @@
 #include <opencv2/cudaarithm.hpp>
 #include <opencv2/cudafilters.hpp>
 
+Image::Image(int image_width, int image_height)
+    : width(image_width), height(image_height),
+      data(static_cast<std::size_t>(image_width) * image_height)
+{
+}
+
+FloatImage::FloatImage(int image_width, int image_height)
+    : width(image_width), height(image_height),
+      data(static_cast<std::size_t>(image_width) * image_height)
+{
+}
+
 namespace
 {
 using Clock = std::chrono::steady_clock;
@@ -234,7 +246,7 @@ struct TriggerContext::Impl
     uint16_t* input_host = nullptr;
         uint16_t* output_host = nullptr;
     cv::cuda::Stream stream;
-    static constexpr int stage_count = 10;
+    static constexpr int stage_count = 11;
     cudaEvent_t stage_start[stage_count]{};
     cudaEvent_t stage_end[stage_count]{};
 
@@ -332,52 +344,21 @@ TriggerContext::TriggerContext(const FloatImage& pedestal, int gaussian_kernel_s
 
 TriggerContext::~TriggerContext() = default;
 
-Image TriggerContext::process(const Image& image, TriggerTiming* timing)
-{
-    return process_impl(image, timing, false);
-}
-
 Image TriggerContext::process_gpu_output(const Image& image, TriggerTiming* timing)
 {
-    return process_impl(image, timing, true);
+    return process_impl(image, timing);
 }
 
 void TriggerContext::process_gpu_output_pgm(const Image& image,
                                             const std::string& filename,
                                             TriggerTiming* timing)
 {
-    process_impl(image, timing, true, &filename);
+    process_impl(image, timing, &filename);
 }
 
-void TriggerContext::copy_centroid_mask(std::vector<uint8_t>& output)
-{
-    cv::Mat mask;
-    impl_->centroid_mask.download(mask);
-    output.assign(mask.data, mask.data + static_cast<std::size_t>(impl_->width) * impl_->height);
-}
-
-void TriggerContext::copy_filtered_image(std::vector<float>& output)
-{
-    cv::Mat filtered;
-    impl_->filtered_image.download(filtered);
-    output.resize(static_cast<std::size_t>(impl_->width) * impl_->height);
-    for (int y = 0; y < impl_->height; ++y)
-        std::copy(filtered.ptr<float>(y), filtered.ptr<float>(y) + impl_->width,
-                  output.begin() + static_cast<std::size_t>(y) * impl_->width);
-}
-
-void TriggerContext::copy_sparkless_image(std::vector<float>& output)
-{
-    cv::Mat image;
-    impl_->sparkless_image.download(image);
-    output.resize(static_cast<std::size_t>(impl_->width) * impl_->height);
-    for (int y = 0; y < impl_->height; ++y)
-        std::copy(image.ptr<float>(y), image.ptr<float>(y) + impl_->width,
-                  output.begin() + static_cast<std::size_t>(y) * impl_->width);
-}
 
 Image TriggerContext::process_impl(const Image& image, TriggerTiming* timing,
-                                   bool gpu_output, const std::string* output_filename)
+                                   const std::string* output_filename)
 {
     if (image.width != impl_->width || image.height != impl_->height)
         throw std::runtime_error("Image dimensions do not match persistent pedestal");
@@ -529,38 +510,33 @@ Image TriggerContext::process_impl(const Image& image, TriggerTiming* timing,
     record_end(8);
 
     record_start(9);
-    cv::Mat final_mask_host;
-    cv::Mat result_gpu_host;
-    if (gpu_output)
-    {
-        uint16_t* image_pointer = impl_->image_gpu.ptr<uint16_t>();
-        uint16_t* result_pointer = impl_->result_gpu.ptr<uint16_t>();
-        std::size_t image_step = impl_->image_gpu.step;
-        std::size_t result_step = impl_->result_gpu.step;
-        void* output_arguments[] = {&image_pointer, &image_step,
-            &centroid_dilated_pointer, &centroid_dilated_step, &result_pointer,
-            &result_step, &width, &height};
-        check_context_cuda(cudaLaunchKernel(
-            reinterpret_cast<const void*>(context_apply_mask),
-            dim3(blocks), dim3(block_size), output_arguments, 0,
-            reinterpret_cast<cudaStream_t>(impl_->stream.cudaPtr())),
-            "persistent GPU output mask");
-        check_context_cuda(cudaMemsetAsync(impl_->count_gpu, 0, sizeof(unsigned int),
-                                           reinterpret_cast<cudaStream_t>(impl_->stream.cudaPtr())),
-                           "clear mask count");
-        void* count_arguments[] = {&centroid_dilated_pointer, &centroid_dilated_step,
-            &impl_->count_gpu, &width, &height};
-        check_context_cuda(cudaLaunchKernel(
-            reinterpret_cast<const void*>(context_count_mask),
-            dim3(blocks), dim3(block_size), count_arguments, 0,
-            reinterpret_cast<cudaStream_t>(impl_->stream.cudaPtr())),
-            "count mask pixels");
-        result_gpu_host = cv::Mat(height, width, CV_16U, impl_->output_host);
-        impl_->result_gpu.download(result_gpu_host, impl_->stream);
-    }
-    else
-        impl_->centroid_dilated.download(final_mask_host, impl_->stream);
+    uint16_t* image_pointer = impl_->image_gpu.ptr<uint16_t>();
+    uint16_t* result_pointer = impl_->result_gpu.ptr<uint16_t>();
+    std::size_t image_step = impl_->image_gpu.step;
+    std::size_t result_step = impl_->result_gpu.step;
+    void* output_arguments[] = {&image_pointer, &image_step,
+        &centroid_dilated_pointer, &centroid_dilated_step, &result_pointer,
+        &result_step, &width, &height};
+    check_context_cuda(cudaLaunchKernel(
+        reinterpret_cast<const void*>(context_apply_mask),
+        dim3(blocks), dim3(block_size), output_arguments, 0,
+        reinterpret_cast<cudaStream_t>(impl_->stream.cudaPtr())),
+        "persistent GPU output mask");
+    check_context_cuda(cudaMemsetAsync(impl_->count_gpu, 0, sizeof(unsigned int),
+                                       reinterpret_cast<cudaStream_t>(impl_->stream.cudaPtr())),
+                       "clear mask count");
+    void* count_arguments[] = {&centroid_dilated_pointer, &centroid_dilated_step,
+        &impl_->count_gpu, &width, &height};
+    check_context_cuda(cudaLaunchKernel(
+        reinterpret_cast<const void*>(context_count_mask),
+        dim3(blocks), dim3(block_size), count_arguments, 0,
+        reinterpret_cast<cudaStream_t>(impl_->stream.cudaPtr())),
+        "count mask pixels");
     record_end(9);
+    record_start(10);
+    cv::Mat result_gpu_host(height, width, CV_16U, impl_->output_host);
+    impl_->result_gpu.download(result_gpu_host, impl_->stream);
+    record_end(10);
     impl_->stream.waitForCompletion();
     auto elapsed_stage = [&](int stage) {
         float milliseconds = 0.0f;
@@ -581,58 +557,46 @@ Image TriggerContext::process_impl(const Image& image, TriggerTiming* timing,
         timing->gaussian_ms = elapsed_stage(6);
         timing->centroid_threshold_ms = elapsed_stage(7);
         timing->centroid_dilation_ms = elapsed_stage(8);
-        timing->download_ms = elapsed_stage(9);
+        timing->mask_apply_ms = elapsed_stage(9);
+        timing->download_ms = elapsed_stage(10);
+        float full_elapsed_ms = 0.0f;
+        check_context_cuda(cudaEventElapsedTime(&full_elapsed_ms, impl_->stage_start[0],
+                                                impl_->stage_end[10]),
+                           "measure full trigger span");
+        timing->full_trigger_ms = static_cast<double>(full_elapsed_ms);
     }
     Image result(image.width, image.height);
     cv::Mat result_host(image.height, image.width, CV_32S, result.data.data());
-    if (gpu_output)
+    if (output_filename)
     {
-        if (output_filename)
+        std::ofstream output(*output_filename, std::ios::binary);
+        if (!output)
+            throw std::runtime_error("Could not create PGM: " + *output_filename);
+        output << "P5\n" << width << ' ' << height << "\n65535\n";
+        for (std::size_t index = 0; index < count; ++index)
         {
-            std::ofstream output(*output_filename, std::ios::binary);
-            if (!output)
-                throw std::runtime_error("Could not create PGM: " + *output_filename);
-            output << "P5\n" << width << ' ' << height << "\n65535\n";
-            for (std::size_t index = 0; index < count; ++index)
-            {
-                const uint16_t pixel = impl_->output_host[index];
-                output.put(static_cast<char>(pixel >> 8));
-                output.put(static_cast<char>(pixel & 0xff));
-            }
-            if (timing)
-                timing->cpu_output_conversion_ms = 0.0;
+            const uint16_t pixel = impl_->output_host[index];
+            output.put(static_cast<char>(pixel >> 8));
+            output.put(static_cast<char>(pixel & 0xff));
         }
-        else
-        {
-            const auto conversion_start = Clock::now();
-            result_gpu_host.convertTo(result_host, CV_32S);
-            if (timing)
-                timing->cpu_output_conversion_ms = context_elapsed_ms(
-                    conversion_start, Clock::now());
-        }
+        if (timing)
+            timing->cpu_output_conversion_ms = 0.0;
     }
     else
     {
-        const auto reconstruction_start = Clock::now();
-        cv::Mat source_host(image.height, image.width, CV_32S,
-                            const_cast<int*>(image.data.data()));
-        source_host.copyTo(result_host);
-        cv::Mat inverse_mask;
-        cv::compare(final_mask_host, 0, inverse_mask, cv::CMP_EQ);
-        result_host.setTo(0, inverse_mask);
+        const auto conversion_start = Clock::now();
+        result_gpu_host.convertTo(result_host, CV_32S);
         if (timing)
             timing->cpu_output_conversion_ms = context_elapsed_ms(
-                reconstruction_start, Clock::now());
+                conversion_start, Clock::now());
     }
-    if (timing && !gpu_output)
-        timing->triggered_pixels = static_cast<std::size_t>(cv::countNonZero(final_mask_host));
-    if (timing && gpu_output)
+    if (timing)
     {
-        unsigned int count = 0;
-        check_context_cuda(cudaMemcpy(&count, impl_->count_gpu, sizeof(count),
+        unsigned int count_result = 0;
+        check_context_cuda(cudaMemcpy(&count_result, impl_->count_gpu, sizeof(count_result),
                                       cudaMemcpyDeviceToHost),
                            "download mask count");
-        timing->triggered_pixels = count;
+        timing->triggered_pixels = count_result;
     }
     return result;
 }

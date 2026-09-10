@@ -29,7 +29,8 @@ struct FloatImage
 struct BatchTiming
 {
     std::array<std::size_t, 3> triggered_pixels{{0, 0, 0}};
-    double gpu_ms = 0.0;
+    // Measured directly via CUDA events (stage 0 start to stage 10 end), not a sum.
+    double full_trigger_ms = 0.0;
     double upload_ms = 0.0;
     double pedestal_ms = 0.0;
     double laplacian_ms = 0.0;
@@ -39,6 +40,7 @@ struct BatchTiming
     double gaussian_ms = 0.0;
     double centroid_threshold_ms = 0.0;
     double centroid_dilation_ms = 0.0;
+    double mask_apply_ms = 0.0;
     double download_ms = 0.0;
 };
 

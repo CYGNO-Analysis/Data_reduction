@@ -1,0 +1,624 @@
+TRIGGER GPU - DETAILED EXPLANATION OF THE ALGORITHM AND IMPLEMENTATION
+========================================================================
+
+This file explains, step by step, what the trigger algorithm does
+physically (which is already known: pedestal subtraction, spark
+correction, Gaussian filter, centroids and dilation) and how each stage
+was written in C++/CUDA to run as fast as possible on the GPU. The target
+audience is someone who understands the logic of the algorithm but is not
+familiar with C++ or GPU programming (CUDA). Every technical term is
+explained in plain language the first time it appears.
+
+Main algorithm file: src/trigger_context.cu
+Interface file (what other parts of the code can call):
+  include/trigger_cuda.hpp
+
+------------------------------------------------------------------
+1. OVERVIEW: WHAT THE ALGORITHM DOES, STEP BY STEP
+------------------------------------------------------------------
+
+For each camera image received (a matrix of pixels, width x height, for
+example 4096 x 2304), the algorithm performs, in this order:
+
+  1. Pedestal subtraction
+       corrected_image = raw_image - pedestal
+     The pedestal is a background noise map, measured beforehand and
+     loaded from a ROOT file. It is the same for every event, so it only
+     needs to be loaded once.
+
+  2. Spark detection (Laplacian filter)
+       Applies a Laplacian filter (a filter that highlights sharp
+       intensity changes, typically used to detect edges/peaks) to the
+       corrected image. Pixels whose Laplacian value is above a limit
+       (spark_cut) are marked as "spark" (a point-like electronic noise
+       artifact, not real physical signal).
+
+  3. Spark threshold
+       Builds a binary mask: each pixel becomes 0 (not a spark) or 255
+       (is a spark), by comparing the Laplacian value against spark_cut.
+
+  4. Dilation of the spark mask (small radius, 1 pixel)
+       "Dilating" a binary mask means expanding the marked regions to the
+       neighboring pixels. This guarantees that the immediate neighborhood
+       of a spark is also removed, not just the exact pixel.
+
+  5. Removing sparks from the image
+       Every pixel marked in the (already dilated) spark mask is zeroed in
+       the corrected image. The result is the "sparkless image"
+       (sparkless/image_sparkless).
+
+  6. Gaussian filter
+       Applies a Gaussian blur (smoothing) to the sparkless image. This
+       reduces high-frequency noise and highlights regions where signal is
+       spread over several pixels (which characterizes a real physical
+       event, unlike point-like noise).
+
+  7. Centroid threshold
+       Builds a new binary mask by comparing the filtered (Gaussian)
+       image against a limit (threshold_cut). Pixels above the limit are
+       candidates to be part of a centroid (a region of physical
+       interest).
+
+  8. Dilation of the centroid mask (larger radius, e.g. 20 pixels)
+       Expands the centroid regions to include a wider neighborhood around
+       each point of interest, making sure the whole "blob" of the
+       physical event is captured, not just the central peak.
+
+  9. Applying the final mask to the original image
+       The final mask (dilated centroids) is used to select which pixels
+       of the ORIGINAL image (not the corrected one, not the filtered one)
+       should be kept. Pixels outside the mask become 0; pixels inside the
+       mask keep their original value. The result is the "triggered
+       image" (final image, containing only the pixels of interest).
+
+ 10. Counting triggered pixels (triggered_pixels)
+       Counts how many pixels of the final mask are active. This is only
+       a monitoring metric; it does not affect the result.
+
+The final product delivered by the trigger is the triggered image (step
+9) plus the pixel count (step 10).
+
+------------------------------------------------------------------
+2. WHY THIS NEEDS TO BE FAST
+------------------------------------------------------------------
+
+The system receives images continuously during data acquisition (DAQ) and
+needs to decide, in real time, which events are interesting. If processing
+each image takes too long, the system either delays the acquisition or
+drops events. That is why the whole algorithm was implemented to run on
+the graphics card (GPU), which can process millions of pixels in
+parallel, and was optimized to eliminate any unnecessary repeated work on
+every event.
+
+------------------------------------------------------------------
+3. BASIC GPU/CUDA CONCEPTS USED IN THIS CODE
+------------------------------------------------------------------
+
+Before going through each stage of the code, a few concepts that appear
+throughout:
+
+- GPU (graphics card): has thousands of simple processing cores, much
+  slower individually than a CPU core, but capable of running the same
+  operation on thousands of pixels at the same time. For an image of
+  4096 x 2304 = 9,437,184 pixels, this is a huge advantage over processing
+  pixel by pixel on a CPU.
+
+- CUDA kernel: a special function (marked with the "__global__" keyword in
+  the code) that runs on the GPU, not the CPU. When the program "launches"
+  a kernel, it specifies how many "threads" (independent lines of
+  execution) should run. In this project, each thread processes exactly 1
+  pixel of the image.
+
+- Thread, block, and index: threads are organized into "blocks". In the
+  code, every kernel computes:
+
+      const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+
+  This is just a formula that turns "which block am I" and "which
+  position inside the block am I" into a single unique number (0, 1, 2,
+  3, ...) that identifies which pixel this thread must process. If that
+  number is greater than or equal to the total pixel count, the thread
+  simply stops (the line "if (index >= count) return;"), because the
+  number of launched threads is always rounded up to a multiple of 256,
+  so a few "extra" threads with no matching pixel can be left over at the
+  end.
+
+  From the unique index, the code computes the row (y) and column (x) of
+  the pixel:
+
+      const int y = index / width;
+      const int x = index % width;
+
+- GpuMat (cv::cuda::GpuMat): a "matrix" (like a table of numbers) that
+  lives in GPU memory, not in the computer's normal memory (RAM). Every
+  intermediate image of the algorithm (corrected image, spark mask,
+  filtered image, etc.) is a GpuMat.
+
+- step (row stride): a GpuMat may reserve slightly more memory per row
+  than strictly needed, for memory alignment/performance reasons. That is
+  why, to compute the address of a pixel on row y, the code uses "step"
+  (the number of bytes reserved per row) instead of simply "width". This
+  appears in almost every function in the file, for example:
+
+      const auto* row = reinterpret_cast<const float*>(
+          reinterpret_cast<const unsigned char*>(data) + y * step);
+
+  In plain words: "skip y whole rows worth of bytes (using the real size
+  of each row, `step`), then interpret that address as a sequence of
+  float numbers, and take position x of that sequence".
+
+- reinterpret_cast: this is simply the C++ way of saying "treat this
+  memory address as if it were a different type". Because "step" is
+  measured in bytes but pixels are float or uint16_t or uint8_t, the code
+  first converts the pointer to "unsigned char*" (1 byte per position) so
+  it can add the byte offset correctly, and then converts it back to the
+  real pixel type (float, uint16_t, etc.) to read/write it.
+
+- Pointer (*): a variable that stores a memory address, not a value
+  directly. "float* pointer" means "pointer points to where a sequence of
+  float numbers begins". The code uses pointers throughout to access GPU
+  memory directly inside kernels, without copying data.
+
+- Pinned memory (host "page-locked" memory): normal computer memory (not
+  GPU memory) that has been marked so the operating system never pages it
+  out or moves it. This makes CPU-GPU transfers faster and more
+  predictable. Allocated with "cudaMallocHost" and freed with
+  "cudaFreeHost".
+
+- CUDA stream: a "queue" of operations that the GPU must execute in order,
+  without the program needing to wait (block) after each one
+  individually. Every stage of the trigger is placed on the same stream,
+  and the program only waits ("stream.waitForCompletion()") once, at the
+  end, when it actually needs the results.
+
+- CUDA event (cudaEvent_t): a "timestamp marker" that can be placed on the
+  stream, to later measure how much time passed between two markers
+  (cudaEventElapsedTime). It is like timing only what matters, without
+  needing to stall the GPU in the middle of processing.
+
+- Constant memory (__constant__): a small, special area of GPU memory,
+  optimized for when all threads read the same values at the same time
+  (for example, the Gaussian filter weights, which are the same for every
+  pixel).
+
+- atomicAdd: an operation that lets thousands of threads add a value to
+  the same counter, at the same time, without one overwriting the result
+  of another. Used to count how many pixels are active in a mask.
+
+With these concepts, each stage of the code below becomes easier to
+follow.
+
+------------------------------------------------------------------
+4. EACH STAGE OF THE ALGORITHM, IN THE CODE
+------------------------------------------------------------------
+
+Each stage below corresponds to a CUDA kernel (a "__global__" function)
+defined near the top of src/trigger_context.cu, and to a call to that
+kernel inside the TriggerContext::process_impl function.
+
+4.0 Reading a kernel line by line: pointers and row access, in detail
+-------------------------------------------------------------------------
+Before going through each stage, it helps to fully dissect one complete
+kernel, since every other kernel in the file follows the same pattern.
+Here is the simplest one, "context_threshold", with every line explained:
+
+    __global__ void context_threshold(const float* source, std::size_t source_step,
+                                      unsigned char* mask, std::size_t mask_step,
+                                      float cut, int width, int height)
+    {
+        const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        const std::size_t count = static_cast<std::size_t>(width) * height;
+        if (index >= count)
+            return;
+        const int y = static_cast<int>(index / width);
+        const int x = static_cast<int>(index % width);
+        const auto* source_row = reinterpret_cast<const float*>(
+            reinterpret_cast<const unsigned char*>(source) + y * source_step);
+        auto* mask_row = reinterpret_cast<unsigned char*>(
+            reinterpret_cast<unsigned char*>(mask) + y * mask_step);
+        mask_row[x] = source_row[x] >= cut ? 255 : 0;
+    }
+
+Line by line:
+
+  __global__ void context_threshold(...)
+      "__global__" tells the compiler this function is a CUDA kernel: it
+      runs on the GPU, and is launched from CPU code with a special
+      syntax (cudaLaunchKernel, used everywhere in this file instead of
+      the "<<<...>>>" syntax some CUDA tutorials show; both do the same
+      thing, cudaLaunchKernel is just the explicit function-call form of
+      it). The function itself does not return a value (void); every
+      thread writes its own result directly into GPU memory through the
+      pointers it receives.
+
+  const float* source, std::size_t source_step
+      "source" is a POINTER: not the image itself, but the memory address
+      where the image's pixel data begins in GPU memory. "const" means
+      this kernel is only allowed to read through it, not write. Right
+      after every image pointer, the code always passes the matching
+      "step" (see section 3): the real number of bytes per row of that
+      specific image, which is needed to jump correctly from one row to
+      the next.
+
+  unsigned char* mask, std::size_t mask_step
+      Same idea, but this is the OUTPUT: a pointer to where this kernel
+      must write its result (the binary mask), plus its own step. This
+      pointer is not "const", because the kernel writes through it.
+
+  float cut, int width, int height
+      Plain numeric parameters (not pointers): the threshold value, and
+      the image dimensions. Every thread receives the same copy of these
+      values.
+
+  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+      As explained in section 3, this computes a single unique number for
+      this thread, used to decide exactly one pixel to process.
+
+  if (index >= count) return;
+      Safety check: if this thread's number is beyond the last real
+      pixel (because the total thread count is rounded up to a multiple
+      of 256), it does nothing and exits immediately. Without this check,
+      the thread would compute a "y" beyond the image height and write
+      out of bounds.
+
+  const int y = index / width;
+  const int x = index % width;
+      Converts the single index number back into a row (y) and a column
+      (x): integer division gives the row, and the remainder gives the
+      column. This is the standard way to map a flat 1D index onto a 2D
+      grid of width x height.
+
+  reinterpret_cast<const unsigned char*>(source) + y * source_step
+      This is the key pointer-arithmetic line, repeated with small
+      variations in every kernel in this file. Step by step:
+        1) "reinterpret_cast<const unsigned char*>(source)" temporarily
+           treats the image pointer as if it pointed to plain bytes
+           (1 byte per step), instead of floats (4 bytes each). This is
+           needed because "source_step" is measured in bytes, not in
+           "number of floats".
+        2) "+ y * source_step" advances that byte pointer forward by
+           exactly y full rows worth of bytes, landing on the very first
+           byte of row y.
+        3) The outer "reinterpret_cast<const float*>(...)" converts that
+           byte address back into a pointer to float numbers, so that
+           reading "source_row[x]" gives the x-th float value in that
+           row, correctly, instead of the x-th byte.
+      This two-step cast (to bytes, advance, back to the real type) is
+      necessary because C++ pointer arithmetic ("pointer + n") always
+      advances by "n times the size of what the pointer points to"; if
+      the code advanced a "float*" directly by "y * source_step", it
+      would move y * source_step FLOATS forward (4 bytes each), which is
+      4 times too far, since source_step is already a byte count. Casting
+      to "unsigned char*" first makes "+ y * source_step" mean "advance
+      by y * source_step BYTES", which is what is actually intended.
+
+  mask_row[x] = source_row[x] >= cut ? 255 : 0;
+      Finally, the actual computation: read the pixel value at column x
+      of the source row, compare it against "cut", and write 255 (spark)
+      or 0 (not a spark) into the same column of the output mask row.
+      "source_row[x]" and "mask_row[x]" use ordinary array-indexing
+      syntax; because "source_row" and "mask_row" are pointers to the
+      first element of their row, "row[x]" is equivalent to reading the
+      memory x positions after where "row" points, which for a float
+      pointer means x floats forward, and for an unsigned char pointer
+      means x bytes forward. The compiler handles that scaling
+      automatically once the pointer has the correct type (float* vs
+      unsigned char*), which is exactly why the two-step cast above
+      matters.
+
+Every other kernel in the file (dilation, Gaussian, mask application,
+counting) follows this exact same skeleton: compute a per-thread index,
+convert it to (y, x), reach the correct row of each buffer with the
+byte-cast-and-add-step trick, then read and/or write through the
+resulting typed pointer. Kernels that need to read neighboring pixels
+(dilation, Gaussian) simply repeat this row-access pattern once per
+neighbor offset, inside a small loop over "-radius .. +radius", instead
+of doing it only once for the pixel itself.
+
+A few additional pointer/syntax details that show up later in section 4:
+
+- Kernels that produce a final image use a THIRD pointer, separate from
+  the input(s): for example "context_apply_mask" receives "image"
+  (uint16_t*, the original pixels, read-only), "mask" (unsigned char*,
+  read-only), and "output" (uint16_t*, write-only) with three independent
+  steps. Reading from two inputs and writing to a third output pointer,
+  all in the same thread, is a very common pattern for "combine two
+  images into a new one" kernels.
+
+- "context_count_mask" receives an "unsigned int* count" pointer that
+  points to a single number in GPU memory (not a whole image), shared by
+  every thread. Because every thread may want to modify that single
+  number at the same time, a plain "*count = *count + 1;" would be
+  unsafe (two threads could read the same old value before either writes
+  it back, losing an increment). "atomicAdd(count, 1U)" is a special
+  GPU instruction that performs "read old value, add 1, write it back" as
+  one indivisible step, so concurrent increments from thousands of
+  threads never get lost.
+
+- Some kernels take a "radius" parameter (dilation, Gaussian) and loop
+  over "for (int offset = -radius; offset <= radius; ++offset)". Inside
+  that loop they call a small helper function ("context_read_mask" or
+  "context_read_float") instead of doing the row-pointer arithmetic
+  directly, because that helper also needs to check whether "y + offset"
+  or "x + offset" falls outside the image and return 0 in that case
+  (see the border handling explained in 4.4 and 4.6).
+
+4.1 Pedestal subtraction
+--------------------------
+Does not use a custom kernel; it uses the ready-made OpenCV CUDA function
+"cv::cuda::subtract", which is already optimized for GPU:
+
+    cv::cuda::subtract(image_float, pedestal_gpu, pedestal_subtracted, ...)
+
+In other words: it takes the image (already converted to numbers with
+decimal places, "float") and subtracts the pedestal, pixel by pixel, all
+on the GPU.
+
+4.2 Spark detection (Laplacian)
+------------------------------------
+Also uses a ready-made OpenCV CUDA function, created only once in the
+class constructor (not recreated on every event):
+
+    laplacian = cv::cuda::createLinearFilter(CV_32F, CV_32F, laplacian_kernel, ...)
+
+It is applied on every event with "laplacian->apply(...)". The filter
+kernel (the 3x3 mask used to detect sharp changes) is defined as a fixed
+matrix in the code:
+
+    -1 -1 -1
+    -1  8 -1
+    -1 -1 -1
+
+This pattern (positive center, negative neighbors) is the classic
+Laplacian filter: it produces a high value when the central pixel is very
+different from its neighborhood, exactly the behavior of a spark (an
+isolated peak).
+
+4.3 Spark threshold (custom kernel: context_threshold)
+-------------------------------------------------------------
+This is the first hand-written kernel in this file. In plain words, for
+each pixel:
+
+    if laplacian_value[pixel] >= spark_cut:
+        mask[pixel] = 255   (it is a spark)
+    else:
+        mask[pixel] = 0     (it is not a spark)
+
+The same "context_threshold" kernel is reused later for the centroid
+threshold; only the input image and the limit (cut) passed as parameters
+change.
+
+4.4 Dilation of the spark mask (kernels context_dilate_horizontal and
+    context_dilate_vertical)
+-------------------------------------------------------------------------
+Dilating a mask normally means: for each pixel, look at every neighbor
+within a radius (for example, a square of side 2*radius+1 around the
+pixel) and mark the pixel as active if ANY neighbor is active.
+
+Doing this directly (looking at a whole square around every pixel) would
+cost (2*radius+1) squared operations per pixel. This code uses a
+mathematical trick called "separable dilation": instead of a single 2D
+pass, it does two 1D passes:
+
+    1) horizontal_dilation[pixel] = maximum among the neighbors on the
+       same row, from x-radius to x+radius;
+    2) vertical_dilation[pixel] = maximum among the neighbors on the same
+       column of the horizontal result, from y-radius to y+radius.
+
+The final result is mathematically identical to dilating with a whole
+square at once, but it costs only 2*(2*radius+1) operations per pixel
+instead of (2*radius+1) squared. For radius 20 (used for centroids), that
+is the difference between 41 operations and 1681 operations per pixel - a
+huge saving, multiplied by millions of pixels and hundreds or thousands
+of events per second.
+
+The helper function "context_read_mask" handles reading pixels outside
+the image border as zero (a "constant zero" border behavior), so the main
+kernel does not need to handle special cases at the edges of the image.
+
+This pair of kernels (horizontal + vertical) is reused both to dilate the
+spark mask (radius 1, hardcoded in the code as "spark_radius = 1") and to
+dilate the centroid mask (configurable radius, "dilation_radius",
+typically 20 in configFile.txt).
+
+IMPORTANT: sparks always use radius 1; centroids use the configured
+radius. This distinction already caused a real bug during the development
+of trigger_gpu_batch (the centroid radius was mistakenly also used for
+sparks), documented in the project's log.txt.
+
+4.5 Removing sparks from the image (kernel context_zero_mask)
+---------------------------------------------------------------
+For each pixel:
+
+    if dilated_spark_mask[pixel] != 0:
+        image[pixel] = 0.0
+
+That is, it directly zeroes, in the image (already subtracted from the
+pedestal), any pixel marked as a spark (or a spark neighbor, after
+dilation). The result is first copied to a separate buffer
+("sparkless_image"), so it does not destroy the original
+"pedestal_subtracted" image, which is not used again after this point, but
+keeping it separate makes the code clearer and allows inspecting
+image_sparkless for debugging (there is even a dedicated method,
+TriggerContext::copy_sparkless_image, just for that).
+
+4.6 Separable Gaussian filter (kernels context_gaussian_horizontal and
+    context_gaussian_vertical)
+-------------------------------------------------------------------------
+A traditional 2D Gaussian filter computes, for each pixel, a weighted
+average of all neighbors within a radius, with weights that decrease with
+distance (a bell/dome shape). This would cost (2*radius+1) squared
+multiplications per pixel.
+
+A mathematical property of the Gaussian allows it to be split into two 1D
+filters (one horizontal, one vertical) without losing precision: applying
+the horizontal Gaussian and then the vertical one (or vice versa) gives
+exactly the same result as the full 2D Gaussian, but costs only
+2*(2*radius+1) multiplications per pixel instead of (2*radius+1) squared.
+
+The weights (how much each neighbor "weighs" in the average, computed
+from the mathematical formula of the Gaussian bell) are computed only
+once, in the class constructor, and copied to the GPU's "__constant__"
+memory ("context_gaussian_weights"), which is a small, very fast memory
+area when all threads read the same values at the same time (exactly the
+case here: every thread uses the same set of weights).
+
+The horizontal kernel computes, for each pixel (y, x):
+
+    value = sum, for offset from -radius to +radius, of:
+                weight[offset] * image[y, x + offset]
+
+The vertical kernel does the same, but summing along the column
+(y + offset) instead of the row. The helper function
+"context_read_float" treats pixels outside the image as zero, again
+avoiding special border cases inside the main kernel.
+
+4.7 Centroid threshold
+------------------------
+Reuses the same kernel from item 4.3 (context_threshold), now with the
+Gaussian-filtered image and the configured "threshold_cut" limit.
+
+4.8 Dilation of the centroid mask
+------------------------------------
+Reuses the same pair of kernels from item 4.4 (context_dilate_horizontal
+and context_dilate_vertical), now with the configured radius
+("dilation_radius", typically 20), applied to the centroid mask instead
+of the spark mask.
+
+4.9 Applying the final mask (kernel context_apply_mask)
+--------------------------------------------------------------
+For each pixel:
+
+    if dilated_centroid_mask[pixel] != 0:
+        final_image[pixel] = original_image[pixel]
+    else:
+        final_image[pixel] = 0
+
+Note that the image used here is the ORIGINAL image (the one that came
+from the camera, still uint16_t, before any pedestal subtraction or
+filtering), not the intermediate filtered image. The mask only serves to
+"cut out" which pixels of the original image should be kept.
+
+This step is done entirely on the GPU. In the past (the project's initial
+version, documented in log.txt as "path A"), the mask was downloaded to
+the CPU and the final image was reconstructed there; today (the
+GPU-output path, used by the online client), both the mask application
+and the pixel count (next item) happen on the GPU, and only the finished
+final image is transferred back to the CPU. This removes an entire
+transfer (the mask) and all the reconstruction work on the CPU.
+
+4.10 Counting triggered pixels (kernel context_count_mask)
+-------------------------------------------------------------------
+For each pixel:
+
+    if dilated_centroid_mask[pixel] != 0:
+        increment a global counter (on the GPU) by 1
+
+The increment uses "atomicAdd", which guarantees that, even with millions
+of threads trying to increment the same counter at the same time, no
+increment is lost (without atomicAdd, two threads could read the same old
+counter value and write the same new value, losing one of the
+increments). The counter starts at zero on every event
+("cudaMemsetAsync(count_gpu, 0, ...)") before this kernel runs.
+
+------------------------------------------------------------------
+5. THE TriggerContext CLASS: WHY EVERYTHING IS SO FAST
+------------------------------------------------------------------
+
+The algorithm itself (items 4.1 to 4.10) is only half of the story. The
+other half is that ALL the preparation work (allocating memory, loading
+the pedestal, creating filters, computing the Gaussian weights) happens a
+SINGLE TIME, when the TriggerContext object is created, and is never
+repeated on every event.
+
+The TriggerContext object keeps, for the entire lifetime of the program:
+
+- Every GPU image buffer (GpuMat), already allocated with the exact size
+  of the image (width x height). On every event, the CONTENT of these
+  buffers is overwritten, but the memory space itself never changes size
+  or gets freed and reallocated. This means the memory used by the
+  program stays constant from the first to the last event - there is no
+  memory growth or leak over time.
+
+- The pedestal, already uploaded to the GPU once. It does not change
+  between events, so there is no reason to send it again.
+
+- The Gaussian filter weights, already computed and copied to the GPU's
+  constant memory.
+
+- The OpenCV CUDA Laplacian filter, already created.
+
+- A "pinned" memory buffer (input_host and output_host) to transfer the
+  input image and the output image between CPU and GPU as fast as
+  possible.
+
+- A CUDA stream and a set of CUDA events, also created only once, reused
+  on every event just to mark/measure time.
+
+On every event, the only new thing entering the system is the camera
+image; everything else (pedestal, buffers, filters, weights, stream,
+events) is already ready and just gets reused. This is the opposite of a
+naive implementation, which would recreate all of this on every processed
+image - which would have a memory allocation and filter setup cost
+dominating the total time, much larger than the actual pixel processing
+itself.
+
+------------------------------------------------------------------
+6. TIME MEASUREMENT (CUDA EVENTS)
+------------------------------------------------------------------
+
+Each of the stages above is timed individually using CUDA events (see
+section 3 for what a CUDA event is). The measured stages, in order, are:
+
+  0. Image upload
+  1. Pedestal subtraction
+  2. Laplacian
+  3. Spark threshold
+  4. Spark dilation
+  5. Spark removal (zero mask)
+  6. Gaussian filter
+  7. Centroid threshold
+  8. Centroid dilation
+  9. Final mask application + pixel count
+ 10. Final image download
+
+The total trigger time ("full_trigger_total", reported in log_gpu.txt and
+log_gpu.csv) is measured directly with a pair of CUDA events that spans
+from the start of stage 0 to the end of stage 10 - that is, it is a real
+elapsed-time measurement on the GPU, not a sum of the individual stage
+measurements. A sum of the individual stages is also computed and
+reported as "Full trigger (sum check)", used only as a cross-check: if
+any GPU work were to run outside of any timed stage, the directly
+measured value and the sum would diverge, signaling a problem in the
+instrumentation. This actually happened in the past in trigger_gpu_batch
+(documented in the project's log.txt) and was fixed.
+
+------------------------------------------------------------------
+7. SUMMARY OF THE OPTIMIZATION CHOICES
+------------------------------------------------------------------
+
+- GPU buffers and pinned memory allocated only once (TriggerContext),
+  eliminating repeated allocation on every event.
+- Pedestal uploaded to the GPU only once.
+- Hand-written CUDA kernels for the main operations (threshold, dilation,
+  Gaussian, mask application, counting), instead of relying entirely on
+  generic ready-made functions.
+- Gaussian and dilations implemented in a separable way (two 1D passes
+  instead of one 2D pass), drastically reducing the number of operations
+  per pixel, especially for large radii (such as the centroid radius of
+  20).
+- Gaussian weights placed in the GPU's "__constant__" memory, optimized
+  for simultaneous reads by all threads.
+- All stages of an event are queued on the same CUDA stream, without
+  waiting for the GPU to finish one stage before queuing the next; there
+  is only one wait at the end of each event.
+- Final mask application and triggered pixel counting also happen on the
+  GPU, avoiding transferring the mask to the CPU and reconstructing the
+  image there.
+- Time measured with CUDA events, without stalling the GPU to time each
+  stage individually (which would introduce artificial delays into the
+  measurement itself).
+
+These choices, combined, are why trigger_gpu can process a whole image
+(upload + full algorithm + download) in a few milliseconds, once the GPU
+has already been initialized on the first event.

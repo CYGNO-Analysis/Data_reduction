@@ -37,15 +37,12 @@ struct TriggerTiming
     double gaussian_ms = 0.0;
     double centroid_threshold_ms = 0.0;
     double centroid_dilation_ms = 0.0;
-    double final_mask_ms = 0.0;
+    double mask_apply_ms = 0.0;
     double download_ms = 0.0;
     double cpu_output_conversion_ms = 0.0;
+    // Measured directly via CUDA events (stage 0 start to stage 10 end), not a sum.
+    double full_trigger_ms = 0.0;
 };
-
-Image trigger_cuda(const Image& image, const FloatImage& pedestal,
-                   int gaussian_kernel_size, float gaussian_sigma,
-                   float spark_cut, float threshold_cut, int dilation_radius,
-                   TriggerTiming* timing = nullptr);
 
 class TriggerContext
 {
@@ -58,19 +55,13 @@ public:
     TriggerContext(const TriggerContext&) = delete;
     TriggerContext& operator=(const TriggerContext&) = delete;
 
-    Image process(const Image& image, TriggerTiming* timing = nullptr);
     Image process_gpu_output(const Image& image, TriggerTiming* timing = nullptr);
     void process_gpu_output_pgm(const Image& image, const std::string& filename,
                                 TriggerTiming* timing = nullptr);
-    void copy_centroid_mask(std::vector<uint8_t>& output);
-    void copy_filtered_image(std::vector<float>& output);
-    void copy_sparkless_image(std::vector<float>& output);
 
 private:
-    Image process_impl(const Image& image, TriggerTiming* timing, bool gpu_output,
+    Image process_impl(const Image& image, TriggerTiming* timing,
                        const std::string* output_filename = nullptr);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
-
-void write_pgm(const std::string& filename, const Image& image);

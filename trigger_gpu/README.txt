@@ -286,11 +286,18 @@ When image saving is enabled, the client also creates:
 The human-readable log_gpu.txt contains the configuration used for the run and a
 separate multi-line block for each processed event. Each block reports upload
 time, pedestal subtraction, Laplacian, spark threshold, spark dilation, spark
-mask, Gaussian filter, centroid threshold, centroid dilation, mask download,
-CPU output conversion, GPU algorithm total, GPU pipeline total, and total
-processing time including host conversion and PGM output. `full_trigger_total`
-is upload plus the GPU algorithm plus image download, so it represents the
-complete trigger before PGM/log I/O. It also reports the number of pixels
+mask, Gaussian filter, centroid threshold, centroid dilation, mask apply (the
+application of the final mask on the GPU plus the triggered pixel count),
+download of the final image, algorithm total, full trigger total, and total
+processing time including PGM output.
+
+`full_trigger_total` is measured directly with CUDA events, from the start of
+the upload stage to the end of the download stage. It is not a sum of the
+individual stage timings, so it correctly captures any GPU work that happens
+between stages. The log also reports `full_trigger_sum_check`, the arithmetic
+sum of upload + algorithm total + mask apply + download, kept only as a
+cross-check against the directly measured value; in this implementation the
+two normally agree within about 0.01 ms. It also reports the number of pixels
 retained in the triggered image.
 
 The log_gpu.csv file contains only the numeric event table with no configuration
@@ -313,17 +320,24 @@ ignores the pedestal and saving options.
 ------------------------
 
 For a 4096 x 2304 image on the RTX PRO 6000, after CUDA initialization, the
-optimized path is typically in these ranges:
+optimized path is typically in these ranges (steady-state events, once CUDA
+has warmed up):
 
-  GPU algorithm:                         approximately 6-10 ms
-  CPU -> GPU upload (uint16 image):      approximately 10-30 ms
-  GPU -> CPU mask download (uint8):      approximately 1-8 ms
-  CPU image reconstruction:              approximately 30-40 ms
+  Upload (uint16 image, pinned host buffer):     approximately 1.4 ms
+  GPU algorithm (pedestal through centroid
+    dilation):                                   approximately 0.7-2.5 ms
+  Mask apply (final mask + pixel count):         approximately 0.05-0.1 ms
+  Download (final uint16 image, pinned host
+    buffer):                                     approximately 1.4 ms
+  full_trigger_total (measured directly):        approximately 3.5-3.6 ms
 
-The first event can be slower because the CUDA context, GPU buffers, and
-filters are initialized. The exact values depend on memory state and system
-load. The `total_processing_ms` value additionally includes host conversion
-and PGM output when image saving is enabled.
+The first event after startup is significantly slower because CUDA context
+initialization, GPU buffer allocation, and filter setup happen during that
+event; full_trigger_total for the first event can be in the 15-20 ms range.
+The exact values depend on memory state and system load. The
+`total_processing_ms` value additionally includes PGM output when image
+saving is enabled and is typically a few hundred milliseconds because it also
+measures the wait for the next MIDAS event.
 
 11. Cleaning and rebuilding
 ---------------------------

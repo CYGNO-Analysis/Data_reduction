@@ -45,6 +45,12 @@ trigger CPU, trigger GPU e trigger GPU batch.
 
 Implementacao mantida em trigger_gpu/.
 
+NOTA (atualizado apos secao 11): o fluxo abaixo descreve a primeira versao
+online, que baixava a mascara e reconstruia a imagem na CPU. Essa etapa foi
+substituida pelo caminho GPU-output descrito na secao 11. O cliente online
+atual (datared_cuda.cpp) usa process_gpu_output_pgm/process_gpu_output, que
+sempre chama process_impl com gpu_output=true.
+
 Fluxo atual por evento:
 
 - imagem da camera convertida para uint16_t / CV_16U;
@@ -53,10 +59,12 @@ Fluxo atual por evento:
 - filtros CUDA persistentes;
 - stream CUDA persistente;
 - etapas do trigger enfileiradas na mesma stream;
-- uma unica espera antes de usar a mascara;
-- mascara final uint8_t / CV_8U, com valores 0 ou 255, baixada para a CPU;
-- image_triggered reconstruida na CPU usando a imagem original e a mascara;
-- arquivos PGM escritos somente depois do processamento;
+- mascara de centroides aplicada sobre a imagem original diretamente na GPU
+  (kernel context_apply_mask), gerando a imagem final uint16_t (result_gpu);
+- contagem de pixels disparados feita por kernel CUDA proprio
+  (context_count_mask), sem baixar a mascara para a CPU;
+- imagem final uint16_t baixada para buffer host pinned (nao a mascara);
+- arquivos PGM escritos diretamente a partir do buffer host pinned;
 - memoria host uint16_t persistente e pinned via cudaMallocHost;
 - CUDA events usados para medir etapas sem sincronizacao intermediaria.
 
@@ -76,16 +84,30 @@ Buffers persistentes principais:
 - filtered_image
 - buffers host pinned uint16_t
 
-Tempos do trigger_gpu:
+Tempos do trigger_gpu (arquitetura atual, gpu_output=true, 11 estagios de
+CUDA events, indices 0 a 10):
 
 - algorithm_total_ms:
-    somente etapas do trigger na GPU;
-- gpu_pipeline_total_ms:
-    upload + algorithm GPU + download da mascara;
+    soma dos estagios 1 a 8 (pedestal ate centroid dilation), somente para
+    referencia/cross-check;
+- mask_apply_ms (estagio 9):
+    aplicacao da mascara final sobre a imagem original (context_apply_mask) e
+    contagem de pixels disparados (context_count_mask), medidos separadamente
+    do download;
+- download_ms (estagio 10):
+    apenas a transferencia da imagem final uint16_t da GPU para o host pinned;
 - cpu_reconstruction_ms:
-    aplicacao da mascara sobre a imagem original na CPU;
-- full_trigger_total_ms:
-    upload + algoritmo GPU + download + reconstruccao CPU;
+    0 ms, pois a mascara e aplicada na GPU (nao ha reconstrucao na CPU);
+- cpu_output_conversion_ms:
+    conversao/escrita do buffer host pinned (PGM ou cv::Mat), sem reconstrucao;
+- full_trigger_ms ("Full trigger total"):
+    medido diretamente por CUDA events, do inicio do estagio 0 (upload) ao fim
+    do estagio 10 (download). Nao e mais uma soma; cobre qualquer kernel
+    executado entre estagios, incluindo mask_apply;
+- full_trigger_sum_ms ("Full trigger (sum check)"):
+    soma de upload + algorithm_total + mask_apply + download, mantida apenas
+    como conferencia cruzada contra o valor medido diretamente. No trigger_gpu
+    a diferenca entre os dois e tipicamente menor que 0.01 ms;
 - total_processing_ms:
     processamento completo, incluindo conversoes/copias adicionais e PGM
     quando o salvamento esta habilitado.
@@ -109,7 +131,7 @@ Resultado observado no trigger_gpu:
 4.3 Stream CUDA persistente
 
 Implementado no TriggerContext. Todas as etapas sao enfileiradas em uma
-stream persistente e a espera ocorre apenas antes da reconstruccao CPU.
+stream persistente e a espera ocorre apenas antes da reconstrucao CPU.
 
 4.4 CUDA events
 
@@ -172,6 +194,10 @@ dilatacoes customizadas:
 
 Implementacao mantida em trigger_gpu_batch/.
 
+NOTA (atualizado apos secoes 12 e 14): as caracteristicas abaixo refletem a
+versao final atual, ja com imagem gerada na GPU (nao mais mascara baixada e
+reconstruida na CPU).
+
 Caracteristicas:
 
 - processa CAM0, CAM1 e CAM2 como um lote;
@@ -179,32 +205,53 @@ Caracteristicas:
 - um pipeline CUDA para tres planos;
 - pedestais das tres cameras enviados uma vez e mantidos na GPU;
 - entrada uint16_t;
-- mascara final uint8_t baixada;
-- reconstruccao das tres imagens na CPU;
-- buffer batch host pinned via cudaMallocHost;
+- mascara de centroides aplicada sobre a imagem original diretamente na GPU
+  (kernel apply_mask_kernel), gerando a imagem final uint16_t (result_gpu)
+  para as tres cameras;
+- contagem de pixels disparados feita por kernel CUDA proprio
+  (count_mask_kernel) sobre a mascara final, sem baixar a mascara para a CPU;
+- as tres imagens finais uint16_t sao baixadas em um unico buffer host pinned;
+- arquivos PGM escritos diretamente do buffer pinned, sem reconstrucao ou
+  conversao adicional na CPU;
+- buffer batch host pinned via cudaMallocHost (entrada e saida);
 - stream CUDA persistente;
-- CUDA events detalham as etapas sem sincronizacao intermediaria.
+- CUDA events detalham as etapas sem sincronizacao intermediaria, incluindo
+  um estagio dedicado para a aplicacao da mascara final (mask_apply_ms),
+  separado do download.
 
 Logs batch:
 
 - log_gpu_batch.txt
 - log_gpu_batch.csv
 
-Tempos batch:
+Tempos batch (11 estagios de CUDA events, indices 0 a 10):
 
-- gpu_ms:
-    tempo GPU do lote das tres cameras;
-- gpu_pipeline_total_ms:
-    upload do lote + etapas GPU + download da mascara;
-- cpu_reconstruction_ms:
-    reconstruccao das tres imagens na CPU;
-- full_trigger_total_ms:
-    GPU pipeline total + reconstruccao CPU;
+- algorithm_total_ms:
+    soma dos estagios 1 a 8 (pedestal ate centroid dilation), somente para
+    referencia/cross-check;
+- mask_apply_ms (estagio 9):
+    aplicacao da mascara final sobre as tres imagens (apply_mask_kernel) e
+    contagem de pixels disparados por camera (count_mask_kernel);
+- download_ms (estagio 10):
+    download das tres imagens finais uint16_t e das contagens por camera;
+- full_trigger_ms ("Full trigger total"):
+    medido diretamente por CUDA events, do inicio do estagio 0 (upload) ao fim
+    do estagio 10 (download). Cobre qualquer kernel executado entre estagios;
+- full_trigger_sum_ms ("Full trigger (sum check)"):
+    soma de upload + algorithm_total + mask_apply + download, mantida como
+    conferencia cruzada. Antes da separacao do estagio mask_apply, essa soma
+    subestimava o tempo real em aproximadamente 2.2 a 2.8 ms por evento,
+    porque apply_mask_kernel e count_mask_kernel rodavam fora de qualquer
+    par de eventos cronometrado;
 - total_ms:
     processamento batch medido pelo cliente, sem interpretar como tempo de
     uma unica camera; inclui o conjunto CAM0/CAM1/CAM2 e, quando habilitado,
     a escrita das imagens ocorre depois dessa medicao dependendo do ponto do
     cliente.
+
+O campo gpu_ms (medido por eventos start_event/end_event dedicados, apenas
+ate antes do download) foi removido apos a introducao de full_trigger_ms, por
+ser redundante e menos preciso.
 
 7. BENCHMARKS GPU BATCH
 ------------------------
@@ -560,3 +607,65 @@ usada como evidencia de equivalencia entre batch e individual.
 - Os builds finais foram recriados e mantem somente:
     trigger_gpu/build/CygnoTriggerCudaDatared;
     trigger_gpu_batch/build/CygnoTriggerCudaBatch.
+
+14. RESUMO DA SESSAO DE 2026-09-10
+-----------------------------------
+
+- Confirmado, revisando log_gpu.txt e o codigo atual, que o cliente online do
+  trigger_gpu ja usa process_gpu_output_pgm/process_gpu_output, ou seja, a
+  mascara e aplicada na GPU e a imagem final uint16_t (nao a mascara) e o que
+  e baixado para o host. As secoes 3 e 6 deste arquivo, que ainda descreviam a
+  arquitetura antiga (mascara baixada + reconstrucao na CPU), foram corrigidas
+  para refletir a versao final atual.
+- Adicionado o campo pedmaps/.gitkeep para versionar a pasta pedmaps vazia sem
+  incluir os arquivos .root gerados (que continuam ignorados pelo .gitignore).
+- Padronizado trigger_gpu_batch/config/configFile.txt com os mesmos
+  comentarios de secao usados em trigger_gpu/config/configFile.txt (Camera
+  info, Trigger configuration, Save images, inspect_only), mantendo os campos
+  especificos do batch (pedestal_histogram_cam0/1/2, max_saved_sets).
+- Identificado, a partir de log_gpu_batch.txt, que full_trigger_total no batch
+  era calculado como uma soma (upload_ms + algorithm_ms + download_ms) que nao
+  incluia os kernels apply_mask_kernel e count_mask_kernel. Esses dois kernels
+  rodavam entre o fim do estagio 8 (centroid dilation) e o inicio do estagio 9
+  (download antigo), sem nenhum par de eventos CUDA proprio. A diferenca entre
+  a soma e o tempo real de GPU (medido por start_event/end_event) era de
+  aproximadamente 2.2 a 2.8 ms por evento no batch.
+- Confirmado que o trigger_gpu individual nao tinha essa mesma subestimacao,
+  porque context_apply_mask e context_count_mask ja estavam dentro do par
+  record_start(9)/record_end(9) (rotulado como "download"), entao a soma
+  antiga ja incluia esse tempo, so com um nome impreciso para o estagio.
+- Implementado full_trigger_ms medido diretamente por CUDA events (do inicio
+  do primeiro estagio ao fim do ultimo estagio), em vez de somado, tanto em
+  trigger_context.cu (trigger_gpu) quanto em batch_trigger.cu
+  (trigger_gpu_batch). A soma antiga foi mantida como full_trigger_sum_ms,
+  exposta como "Full trigger (sum check)" nos logs/console/CSV, servindo
+  apenas como conferencia cruzada.
+- Separado um novo estagio dedicado, mask_apply_ms (estagio 9), cobrindo
+  apenas a aplicacao da mascara final e a contagem de pixels disparados,
+  isolado do estagio de download puro (que passou a ser o estagio 10).
+  stage_count subiu de 10 para 11 em ambos TriggerContext::Impl e
+  BatchTrigger::Impl.
+- Apos a separacao do estagio mask_apply, a diferenca entre full_trigger_ms
+  (medido) e full_trigger_sum_ms (somado) caiu para ruido de medicao em ambos
+  os algoritmos:
+    trigger_gpu: full_trigger_total=18.9181 ms, sum_check=18.9099 ms
+      (diferenca ~0.008 ms);
+    trigger_gpu_batch: full_trigger_total=12.9471 ms, sum_check=12.9431 ms
+      (diferenca ~0.004 ms), contra ~2.2 a 2.8 ms antes da correcao.
+- Removido o campo gpu_ms do BatchTiming, junto com os eventos CUDA dedicados
+  start_event/end_event em BatchTrigger::Impl (criacao, destruicao, gravacao e
+  leitura), por terem se tornado redundantes e menos precisos que
+  full_trigger_ms. A linha "GPU batch: ... ms" foi removida do log de texto do
+  batch (nunca esteve no CSV nem no console).
+- Novos campos adicionados a TriggerTiming e BatchTiming: mask_apply_ms e
+  full_trigger_ms. Novas colunas nos CSVs: mask_apply_ms e
+  full_trigger_sum_check_ms. Novas linhas no console e nos logs de texto para
+  "Mask apply" e "Full trigger (sum check)".
+- Builds recompilados e executados com sucesso (exit code 0) para trigger_gpu
+  e trigger_gpu_batch apos cada etapa de alteracao.
+- trigger_gpu/README.txt e trigger_gpu_batch/README.txt foram atualizados para
+  descrever a metodologia de tempo atual (full_trigger_ms medido diretamente,
+  full_trigger_sum_ms como cross-check, estagio mask_apply separado do
+  download) e para remover a mencao ao campo GPU batch removido.
+- Nenhum git commit ou git push foi feito pelo assistente nesta sessao ate o
+  momento deste registro.

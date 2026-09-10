@@ -102,11 +102,29 @@ The online print uses the same timing vocabulary as trigger_gpu:
   upload
   download
   full_trigger_total
+  full_trigger_sum_check
   total
 
 Here `algorithm` and `full_trigger_total` refer to the three-camera batch. The
 `total` includes the host bank copies and, when enabled, PGM output for all
 three cameras.
+
+`full_trigger_total` is measured directly with CUDA events, from the start of
+the upload stage to the end of the download stage, so it correctly captures
+any GPU work that happens between stages, including mask application and
+pixel counting. `full_trigger_sum_check` is the arithmetic sum of upload +
+algorithm total + mask apply + download, kept only as a cross-check against
+the directly measured value.
+
+The human-readable log_gpu_batch.txt additionally reports a `Mask apply` line,
+separate from `Download`. It covers the GPU kernel that applies the final
+centroid mask to the original three-camera image (producing the final
+uint16_t image) and the kernel that counts triggered pixels per camera. Before
+this stage was measured separately, it was launched between the last
+algorithm stage and the download stage without a dedicated CUDA event pair,
+so it was silently missing from `full_trigger_sum_check`; the gap was
+approximately 2.2-2.8 ms per event on this GPU. Splitting it into its own
+stage closed that gap to CUDA-event measurement noise (well under 0.01 ms).
 
 The input images are uploaded as uint16_t. The GPU applies the final mask and
 downloads the three triggered images as uint16_t in a persistent pinned output

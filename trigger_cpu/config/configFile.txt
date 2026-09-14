@@ -1,0 +1,20 @@
+# Camera info
+pedestal_file=../pedmaps/pedmap_run123685_rebin1.root
+pedestal_histogram=pedmap_1
+camera_id=1
+width=4096
+height=2304
+
+# Trigger configuration
+gaussian_kernel_size=27
+gaussian_sigma=8.0
+spark_cut=400.0
+threshold_cut=0.5
+dilation_radius=20
+
+# Save images
+save_pairs_directory=../comparison_images
+max_saved_pairs=5
+
+# Set inspect_only=true to inspect CAM data
+inspect_only=false

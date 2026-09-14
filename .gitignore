@@ -1,0 +1,23 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.so.*
+
+# Bundled/local dependencies (CUDA toolkit, OpenCV builds) - too large for git
+/third_party/
+/trigger_cpu/third_party/
+/trigger_gpu/third_party
+/trigger_gpu_batch/third_party
+!/trigger_gpu/third_party
+!/trigger_gpu_batch/third_party
+
+# Generated data / runtime output
+/comparison_images/*
+!/comparison_images/.gitkeep
+/pedmaps/*.root
+*.log
+
+# Editor
+.vscode/
